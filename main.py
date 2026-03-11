@@ -278,6 +278,11 @@ async def send_otp(payload: Payload, request: Request):
     # Send OTP email
     email_send_otp(email, otp, prod["name"])
 
+    # In TEST_MODE: include OTP in response so remote test clients can read it
+    # In production (TEST_MODE=false): OTP is NEVER exposed in the response
+    if TEST_MODE:
+        return JSONResponse({"data": aes_encrypt({"ok": True, "reason": "sent", "test_otp": otp})})
+
     return JSONResponse({"data": aes_encrypt({"ok": True, "reason": "sent"})})
 
 
