@@ -34,7 +34,7 @@ from database import (
     init_db, get_product, normalize_identity,
     generate_otp, store_otp, is_valid_otp, is_identity_verified,
     register_license, verify_license,
-    revoke_license, mark_refunded
+    revoke_license, mark_refunded, backup_db
 )
 
 app = FastAPI()
@@ -510,6 +510,45 @@ async def admin_refund(payload: Payload):
         notify_refund(identity, identity_type, product_name)
 
     return JSONResponse({"data": aes_encrypt({"ok": ok, "refunded": ok})})
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ADMIN — BACKUP DB
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.post("/admin/backup_db")
+async def admin_backup_db(payload: Payload):
+    """
+    Admin — trigger an immediate full backup right now.
+    Run this BEFORE every redeploy to ensure LIVE is up to date.
+
+    Sends (encrypted):
+        {
+          admin_token:  "xxx",
+          live:         true,   ← overwrite licenses_LIVE.db    (default true)
+          hist:         true    ← create   licenses_PREV_*.db   (default true)
+        }
+
+    Returns (encrypted):
+        { ok: true,  live: "licenses_LIVE.db", hist: "licenses_PREV_....db" }
+        { ok: false, error: "reason" }
+
+    Provider support:
+        sqlite     → uploads to Google Drive (requires backup_gdrive=true)
+        turso      → not needed (Turso is persistent, survives redeploys)
+        postgresql → planned (pg_dump to Drive)
+        mysql      → planned (mysqldump to Drive)
+        mongodb    → planned (mongodump to Drive)
+    """
+    req = aes_decrypt(payload.data)
+    if not req or req.get("admin_token") != ADMIN_TOKEN:
+        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
+
+    upload_live = req.get("live", True)
+    upload_hist = req.get("hist", True)
+
+    result = backup_db(upload_live=upload_live, upload_hist=upload_hist)
+    return JSONResponse({"data": aes_encrypt(result)})
 
 
 # ═════════════════════════════════════════════════════════════════════════════

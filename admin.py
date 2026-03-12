@@ -423,6 +423,44 @@ def cmd_search(keyword):
     print()
 
 
+def cmd_backup(live=True, hist=True):
+    """
+    Trigger an immediate backup right now.
+    Run this before every redeploy to ensure LIVE is current.
+
+    Flags:
+      --live-only  → only update licenses_LIVE.db
+      --hist-only  → only create licenses_PREV_timestamp.db
+      (default: both)
+    """
+    from database import backup_db, DATABASE_INFO, _PROVIDER
+    print()
+    print(f"  BACKUP  (provider={_PROVIDER.upper()}, live={live}, hist={hist})")
+    sep()
+
+    result = backup_db(upload_live=live, upload_hist=hist)
+
+    if result.get("ok"):
+        if result.get("live"):
+            print(f"  ✓ LIVE  : {result['live']}")
+        if result.get("hist"):
+            print(f"  ✓ HIST  : {result['hist']}")
+        folder = DATABASE_INFO.get("gdrive_folder_id", "root")
+        print(f"  Folder  : {folder}")
+        print(f"\n  Backup complete — safe to redeploy.\n")
+    else:
+        err = result.get("error", result.get("reason", "unknown"))
+        print(f"  ✗ FAILED: {err}")
+        print()
+        if "backup_gdrive is false" in err:
+            print("  To enable: set backup_gdrive=true in DATABASE_INFO")
+            print("  and set GDRIVE_CREDENTIALS_JSON env var")
+        elif "not yet implemented" in err:
+            print(f"  Note: backup_db is not yet implemented for {_PROVIDER}")
+            print(f"  For {_PROVIDER}, data persists automatically — no backup needed before redeploy.")
+        print()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 USAGE = """
@@ -448,6 +486,10 @@ USAGE = """
   python admin.py products                                 list all products
   python admin.py addproduct                               add a new product
   python admin.py otps                                     OTP activity (email + sms)
+
+  python admin.py backup                                   backup now (LIVE + HIST)
+  python admin.py backup --live-only                       backup LIVE only
+  python admin.py backup --hist-only                       backup HIST only
 """
 
 if __name__ == "__main__":
@@ -489,5 +531,13 @@ if __name__ == "__main__":
         cmd_addproduct()
     elif args[0] == "otps":
         cmd_otps()
+    elif args[0] == "backup":
+        flags     = set(args[1:])
+        live_only = "--live-only" in flags
+        hist_only = "--hist-only" in flags
+        cmd_backup(
+            live = not hist_only,
+            hist = not live_only
+        )
     else:
         print(USAGE)

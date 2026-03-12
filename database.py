@@ -4,9 +4,28 @@ database.py — Multi-provider database layer for the License Server.
 Set DATABASE_INFO environment variable (JSON) to choose your provider:
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SQLITE (default — local file, good for dev/testing):
-  DATABASE_INFO = {"provider": "sqlite", "path": "licenses.db",
-                   "backup_gdrive": false, "backup_every_n": 10}
+SQLITE (local file — with optional Google Drive backup + auto-restore):
+  DATABASE_INFO = {
+    "provider":        "sqlite",
+    "path":            "licenses.db",
+    "backup_gdrive":   true,
+    "backup_every_n":  10,
+    "gdrive_folder_id": "your_google_drive_folder_id"
+  }
+  Also set: GDRIVE_CREDENTIALS_JSON = service account JSON contents
+
+  How backup works:
+    Every N-th register() call writes 2 files to Google Drive:
+      licenses_LIVE.db                  ← always overwritten (used for restore)
+      licenses_PREV_YYYYMMDD_HHMMSS.db  ← new timestamped file every cycle (full history)
+    Runs in background thread — never blocks requests.
+    Drive grows by one PREV_* file per backup cycle.
+
+  How restore works (on server startup):
+    - licenses.db exists AND has real licenses → use it, skip restore.
+    - licenses.db missing, empty, or corrupt  → download licenses_LIVE.db from Drive.
+    - LIVE missing or corrupt                 → CRITICAL warning, start fresh.
+    - After restore, schema migration runs (CREATE IF NOT EXISTS — safe, never wipes data).
 
 TURSO (hosted SQLite — survives redeploys, free tier):
   DATABASE_INFO = {"provider": "turso",
@@ -31,11 +50,6 @@ MONGODB (Atlas or self-hosted):
                    "url": "mongodb+srv://user:pass@cluster.mongodb.net/dbname",
                    "database": "licenses"}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-SQLite auto-backup to Google Drive:
-  Set backup_gdrive=true and backup_every_n=N (default 10).
-  Also set: GDRIVE_CREDENTIALS_JSON = contents of your service account JSON
-  Every N register() calls → DB file is uploaded to Google Drive automatically.
 
 All providers implement the same public API:
   init_db()
@@ -95,66 +109,229 @@ def plan_expiry(plan, paid_at):
     return None
 
 # ═════════════════════════════════════════════════════════════════
-#  PROVIDER: SQLITE  (local file)
+#  PROVIDER: SQLITE  (local file + Google Drive backup/restore)
 # ═════════════════════════════════════════════════════════════════
+#
+#  Every backup cycle writes 2 files to Google Drive:
+#    licenses_LIVE.db                  ← always overwritten (fast restore target)
+#    licenses_PREV_YYYYMMDD_HHMMSS.db  ← new timestamped file (full history)
+#
+#  Restore sequence on startup:
+#    1. licenses.db exists AND has licenses → use as-is (normal restart / Railway restart)
+#    2. licenses.db missing, empty, corrupt → download licenses_LIVE.db from Drive
+#    3. LIVE missing or corrupt             → CRITICAL warning, start fresh
+#
+
+_GDRIVE_LIVE_NAME = "licenses_LIVE.db"
+# PREV files are named licenses_PREV_YYYYMMDD_HHMMSS.db — see _gdrive_upload()
+
+_SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL, price_inr REAL, price_usd REAL,
+    razorpay_link TEXT, gumroad_product_id TEXT, gumroad_link TEXT,
+    max_machines INTEGER NOT NULL DEFAULT 1, is_active INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS identity_otps (
+    identity TEXT NOT NULL, identity_type TEXT NOT NULL DEFAULT 'email',
+    otp TEXT NOT NULL, sent_at REAL NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0, verified INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (identity, identity_type)
+);
+CREATE TABLE IF NOT EXISTS customers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    identity TEXT NOT NULL, identity_type TEXT NOT NULL DEFAULT 'email',
+    email TEXT, phone TEXT, full_name TEXT, country TEXT,
+    created_at REAL NOT NULL, updated_at REAL,
+    UNIQUE(identity, identity_type)
+);
+CREATE TABLE IF NOT EXISTS payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id TEXT NOT NULL, customer_id INTEGER NOT NULL,
+    source TEXT NOT NULL, payment_ref TEXT NOT NULL UNIQUE,
+    amount REAL NOT NULL, currency TEXT NOT NULL,
+    plan TEXT NOT NULL DEFAULT 'lifetime',
+    paid_at REAL NOT NULL, is_refunded INTEGER NOT NULL DEFAULT 0, refunded_at REAL
+);
+CREATE TABLE IF NOT EXISTS licenses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id TEXT NOT NULL, customer_id INTEGER NOT NULL,
+    payment_id INTEGER NOT NULL, unique_key TEXT NOT NULL UNIQUE,
+    machine_id TEXT NOT NULL, machine_label TEXT,
+    plan TEXT NOT NULL DEFAULT 'lifetime', is_active INTEGER NOT NULL DEFAULT 1,
+    paid_at REAL NOT NULL, expires_at REAL, activated_at REAL NOT NULL,
+    last_seen_at REAL, last_seen_ip TEXT,
+    verify_count INTEGER NOT NULL DEFAULT 0, revoked_at REAL, revoke_reason TEXT
+);
+CREATE TABLE IF NOT EXISTS verify_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT,
+    license_id INTEGER, identity TEXT, ip_address TEXT,
+    result TEXT NOT NULL, called_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lic_ukey  ON licenses(unique_key);
+CREATE INDEX IF NOT EXISTS idx_lic_prod  ON licenses(product_id);
+CREATE INDEX IF NOT EXISTS idx_lic_cust  ON licenses(customer_id);
+CREATE INDEX IF NOT EXISTS idx_otp_ident ON identity_otps(identity, identity_type);
+CREATE INDEX IF NOT EXISTS idx_vlog_time ON verify_log(called_at);
+"""
+
+# ── Google Drive service builder ───────────────────────────────────────────────
+
+def _gdrive_service():
+    """
+    Build and return an authenticated Google Drive service object.
+    Raises ImportError if google libs not installed.
+    Raises ValueError if GDRIVE_CREDENTIALS_JSON not set.
+    """
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+    creds_json = os.environ.get("GDRIVE_CREDENTIALS_JSON", "")
+    if not creds_json:
+        raise ValueError("GDRIVE_CREDENTIALS_JSON not set")
+    creds = Credentials.from_service_account_info(
+                json.loads(creds_json),
+                scopes=["https://www.googleapis.com/auth/drive.file"])
+    return build("drive", "v3", credentials=creds)
+
+def _gdrive_find_file(service, name: str, folder_id: str) -> str:
+    """Return Drive file ID for given filename in folder, or None if not found."""
+    q = f"name='{name}' and trashed=false"
+    if folder_id:
+        q += f" and '{folder_id}' in parents"
+    res = service.files().list(q=q, fields="files(id,name)", pageSize=5).execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
+
+# ── Startup restore ────────────────────────────────────────────────────────────
+
+def _sqlite_needs_restore(path: str) -> bool:
+    """
+    Return True if the DB file should be replaced by a Drive backup.
+
+    Decision logic:
+      - File missing                    → True  (redeploy wiped it)
+      - File unreadable / corrupt       → True
+      - licenses table missing          → True  (blank schema)
+      - licenses table exists, count>0  → False (real data, keep it)
+      - licenses table exists, count=0  → True  (no customers ever registered)
+        NOTE: we use licenses (not customers/products) as the signal because:
+          • products are seeded at every deploy via add_product() — count>0 always
+          • customers row is created at register time, same as licenses
+          • licenses is the single source of truth that real users exist
+    """
+    if not os.path.exists(path):
+        return True
+    if os.path.getsize(path) == 0:
+        return True
+    try:
+        import sqlite3
+        conn  = sqlite3.connect(path)
+        # Check the licenses table exists
+        has_table = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='table' AND name='licenses'"
+        ).fetchone()[0]
+        if not has_table:
+            conn.close(); return True
+        count = conn.execute("SELECT COUNT(*) FROM licenses").fetchone()[0]
+        conn.close()
+        return count == 0   # no licenses = no real customers = restore from Drive
+    except Exception:
+        return True         # corrupt file → restore
+
+def _sqlite_restore_from_gdrive(path: str) -> bool:
+    """
+    Download licenses_LIVE.db from Google Drive and restore it.
+    Returns True if restore succeeded, False otherwise.
+
+    Only LIVE is used for restore — PREV_* files are history only.
+    If LIVE is missing or corrupt → logs CRITICAL, returns False → fresh start.
+    """
+    backup_enabled = DATABASE_INFO.get("backup_gdrive", False)
+    folder_id      = DATABASE_INFO.get("gdrive_folder_id", "")
+
+    if not backup_enabled:
+        print("  [RESTORE] backup_gdrive=false — skipping restore attempt")
+        return False
+
+    try:
+        from googleapiclient.http import MediaIoBaseDownload
+        service = _gdrive_service()
+    except ImportError:
+        print("  [RESTORE] google-api-python-client not installed — cannot restore")
+        return False
+    except ValueError as e:
+        print(f"  [RESTORE] {e} — cannot restore")
+        return False
+
+    print(f"  [RESTORE] Looking for {_GDRIVE_LIVE_NAME} in Google Drive ...")
+    try:
+        file_id = _gdrive_find_file(service, _GDRIVE_LIVE_NAME, folder_id)
+        if not file_id:
+            print(f"  [RESTORE] {_GDRIVE_LIVE_NAME} not found — no backup exists yet")
+            print(f"  [RESTORE] Starting fresh (first ever deploy or Drive not configured)")
+            return False
+
+        # Download to temp file first, verify, then move into place
+        tmp_path = path + ".restore_tmp"
+        request  = service.files().get_media(fileId=file_id)
+        with open(tmp_path, "wb") as f:
+            downloader = MediaIoBaseDownload(f, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+
+        # Verify downloaded file is a valid SQLite DB with real license data
+        import sqlite3 as _sq3
+        try:
+            _conn  = _sq3.connect(tmp_path)
+            count  = _conn.execute("SELECT COUNT(*) FROM licenses").fetchone()[0]
+            ccount = _conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
+            _conn.close()
+            if count == 0:
+                print(f"  [RESTORE] {_GDRIVE_LIVE_NAME} has 0 licenses — "
+                      f"backup exists but no customers yet, starting fresh")
+                os.remove(tmp_path)
+                return False
+        except Exception as e:
+            print(f"  [RESTORE] CRITICAL: {_GDRIVE_LIVE_NAME} is corrupt ({e})")
+            print(f"  [RESTORE] Recover manually from a licenses_PREV_*.db file in Drive")
+            if os.path.exists(tmp_path): os.remove(tmp_path)
+            return False
+
+        # Good — move into place (keep old file as emergency backup)
+        if os.path.exists(path):
+            os.replace(path, path + ".pre_restore_bak")
+        os.replace(tmp_path, path)
+        print(f"  [RESTORE] ✓ Restored {_GDRIVE_LIVE_NAME} — "
+              f"{count} licenses, {ccount} customers recovered")
+        return True
+
+    except Exception as e:
+        print(f"  [RESTORE] CRITICAL: Download failed: {e}")
+        print(f"  [RESTORE] Check GDRIVE_CREDENTIALS_JSON and gdrive_folder_id")
+        return False
+
+# ── SQLite init (entry point) ──────────────────────────────────────────────────
 
 def _sqlite_init():
     import sqlite3
     global _sqlite_path
     _sqlite_path = DATABASE_INFO.get("path", os.environ.get("DB_PATH", "licenses.db"))
 
-    SCHEMA = """
-    CREATE TABLE IF NOT EXISTS products (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT NOT NULL UNIQUE,
-        name TEXT NOT NULL, price_inr REAL, price_usd REAL,
-        razorpay_link TEXT, gumroad_product_id TEXT, gumroad_link TEXT,
-        max_machines INTEGER NOT NULL DEFAULT 1, is_active INTEGER NOT NULL DEFAULT 1,
-        created_at REAL NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS identity_otps (
-        identity TEXT NOT NULL, identity_type TEXT NOT NULL DEFAULT 'email',
-        otp TEXT NOT NULL, sent_at REAL NOT NULL,
-        attempts INTEGER NOT NULL DEFAULT 0, verified INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (identity, identity_type)
-    );
-    CREATE TABLE IF NOT EXISTS customers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        identity TEXT NOT NULL, identity_type TEXT NOT NULL DEFAULT 'email',
-        email TEXT, phone TEXT, full_name TEXT, country TEXT,
-        created_at REAL NOT NULL, updated_at REAL,
-        UNIQUE(identity, identity_type)
-    );
-    CREATE TABLE IF NOT EXISTS payments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        product_id TEXT NOT NULL, customer_id INTEGER NOT NULL,
-        source TEXT NOT NULL, payment_ref TEXT NOT NULL UNIQUE,
-        amount REAL NOT NULL, currency TEXT NOT NULL,
-        plan TEXT NOT NULL DEFAULT 'lifetime',
-        paid_at REAL NOT NULL, is_refunded INTEGER NOT NULL DEFAULT 0, refunded_at REAL
-    );
-    CREATE TABLE IF NOT EXISTS licenses (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        product_id TEXT NOT NULL, customer_id INTEGER NOT NULL,
-        payment_id INTEGER NOT NULL, unique_key TEXT NOT NULL UNIQUE,
-        machine_id TEXT NOT NULL, machine_label TEXT,
-        plan TEXT NOT NULL DEFAULT 'lifetime', is_active INTEGER NOT NULL DEFAULT 1,
-        paid_at REAL NOT NULL, expires_at REAL, activated_at REAL NOT NULL,
-        last_seen_at REAL, last_seen_ip TEXT,
-        verify_count INTEGER NOT NULL DEFAULT 0, revoked_at REAL, revoke_reason TEXT
-    );
-    CREATE TABLE IF NOT EXISTS verify_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT,
-        license_id INTEGER, identity TEXT, ip_address TEXT,
-        result TEXT NOT NULL, called_at REAL NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_lic_ukey  ON licenses(unique_key);
-    CREATE INDEX IF NOT EXISTS idx_lic_prod  ON licenses(product_id);
-    CREATE INDEX IF NOT EXISTS idx_lic_cust  ON licenses(customer_id);
-    CREATE INDEX IF NOT EXISTS idx_otp_ident ON identity_otps(identity, identity_type);
-    CREATE INDEX IF NOT EXISTS idx_vlog_time ON verify_log(called_at);
-    """
+    # ── STEP 1: Restore from Drive if DB is blank/missing ──────────────────
+    if _sqlite_needs_restore(_sqlite_path):
+        print(f"  [DB] licenses.db is blank or missing — attempting restore ...")
+        restored = _sqlite_restore_from_gdrive(_sqlite_path)
+        if not restored:
+            print(f"  [DB] Starting fresh (no backup available or backup_gdrive=false)")
+    else:
+        print(f"  [DB] licenses.db exists with data — using as-is")
+
+    # ── STEP 2: Apply schema (CREATE IF NOT EXISTS — never wipes data) ──────
     conn = sqlite3.connect(_sqlite_path)
-    conn.executescript(SCHEMA)
+    conn.executescript(_SQLITE_SCHEMA)
     conn.commit()
     conn.close()
     print(f"  [DB] SQLite ready: {_sqlite_path}")
@@ -167,56 +344,192 @@ def _sqlite_conn():
     conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
-# Google Drive backup counter
-_backup_counter = 0
-_backup_lock    = threading.Lock()
+# ── Two independent backup counters ───────────────────────────────────────────
+#
+#  backup_live_every_n  (default 3)
+#    → overwrite licenses_LIVE.db every N registrations
+#    → keeps LIVE fresh for fast restore
+#
+#  backup_hist_every_n  (default 10)
+#    → create licenses_PREV_timestamp.db every N registrations
+#    → permanent history, never overwritten
+#
+#  Both counters are independent. Example with live=3, hist=10:
+#    reg #1  → nothing
+#    reg #2  → nothing
+#    reg #3  → LIVE updated
+#    reg #6  → LIVE updated
+#    reg #9  → LIVE updated
+#    reg #10 → LIVE updated + PREV_timestamp created
+#    reg #12 → LIVE updated
+#    reg #20 → LIVE updated + PREV_timestamp created
+#
+
+_live_counter = 0
+_hist_counter = 0
+_backup_lock  = threading.Lock()
 
 def _sqlite_maybe_backup():
-    """Upload SQLite file to Google Drive every N register calls."""
-    backup_enabled = DATABASE_INFO.get("backup_gdrive", False)
-    backup_every   = int(DATABASE_INFO.get("backup_every_n", 10))
-    if not backup_enabled:
-        return
-    global _backup_counter
+    """
+    Called after every successful register().
+    Checks both counters and triggers appropriate background uploads.
+    No-op if backup_gdrive=false or provider is not sqlite.
+    """
+    if _PROVIDER != "sqlite": return
+    if not DATABASE_INFO.get("backup_gdrive", False): return
+
+    live_every = int(DATABASE_INFO.get("backup_live_every_n",
+                     DATABASE_INFO.get("backup_every_n", 3)))   # legacy fallback
+    hist_every = int(DATABASE_INFO.get("backup_hist_every_n", 10))
+
+    global _live_counter, _hist_counter
+    do_live = do_hist = False
+
     with _backup_lock:
-        _backup_counter += 1
-        if _backup_counter < backup_every:
-            return
-        _backup_counter = 0
-    # Run backup in background thread so it doesn't block the request
-    threading.Thread(target=_gdrive_upload, daemon=True).start()
+        _live_counter += 1
+        _hist_counter += 1
+        if _live_counter >= live_every:
+            _live_counter = 0
+            do_live = True
+        if _hist_counter >= hist_every:
+            _hist_counter = 0
+            do_hist = True
 
-def _gdrive_upload():
-    """Upload licenses.db to Google Drive using service account."""
-    creds_json = os.environ.get("GDRIVE_CREDENTIALS_JSON", "")
-    folder_id  = DATABASE_INFO.get("gdrive_folder_id", "")
-    if not creds_json:
-        print("  [BACKUP] GDRIVE_CREDENTIALS_JSON not set — skipping backup")
-        return
+    if do_live or do_hist:
+        threading.Thread(
+            target=_gdrive_upload,
+            args=(do_live, do_hist),
+            daemon=True
+        ).start()
+
+# ── Google Drive upload ────────────────────────────────────────────────────────
+
+def _gdrive_upload(upload_live: bool = True, upload_hist: bool = True):
+    """
+    Upload current licenses.db snapshot to Google Drive.
+
+    upload_live=True  → overwrite licenses_LIVE.db  (fast restore target)
+    upload_hist=True  → create  licenses_PREV_YYYYMMDD_HHMMSS.db (history)
+
+    Called automatically by _sqlite_maybe_backup() in a background thread.
+    Also called directly by backup_db() for a manual / pre-redeploy backup
+    (both flags True by default in that case).
+
+    Snapshot is taken via SQLite's online backup API — atomic, consistent,
+    never blocks active write transactions.
+    """
+    if not upload_live and not upload_hist:
+        return {"ok": True, "msg": "nothing to do"}
+
+    folder_id = DATABASE_INFO.get("gdrive_folder_id", "")
+    tmp_snap  = _sqlite_path + ".snap"
+    snap_conn = None
+    results   = {}
+
     try:
-        from google.oauth2.service_account import Credentials
-        from googleapiclient.discovery import build
         from googleapiclient.http import MediaFileUpload
-        import io
-
-        creds   = Credentials.from_service_account_info(
-                      json.loads(creds_json),
-                      scopes=["https://www.googleapis.com/auth/drive.file"])
-        service = build("drive", "v3", credentials=creds)
-
-        fname = f"licenses_backup_{time.strftime('%Y%m%d_%H%M%S')}.db"
-        meta  = {"name": fname}
-        if folder_id:
-            meta["parents"] = [folder_id]
-
-        media = MediaFileUpload(_sqlite_path, mimetype="application/octet-stream")
-        service.files().create(body=meta, media_body=media, fields="id").execute()
-        print(f"  [BACKUP] SQLite backed up to Google Drive: {fname}")
+        service = _gdrive_service()
     except ImportError:
-        print("  [BACKUP] google-api-python-client not installed — "
-              "run: pip install google-api-python-client google-auth --break-system-packages")
+        msg = ("google-api-python-client not installed — "
+               "run: pip install google-api-python-client google-auth --break-system-packages")
+        print(f"  [BACKUP] {msg}")
+        return {"ok": False, "error": msg}
+    except ValueError as e:
+        print(f"  [BACKUP] {e}")
+        return {"ok": False, "error": str(e)}
+
+    try:
+        # ── Consistent snapshot ──────────────────────────────────────────────
+        import sqlite3
+        src       = sqlite3.connect(_sqlite_path)
+        dst       = sqlite3.connect(":memory:")
+        src.backup(dst)
+        src.close()
+        snap_conn = sqlite3.connect(tmp_snap)
+        dst.backup(snap_conn)
+        dst.close()
+        snap_conn.close()
+        snap_conn = None
+
+        # ── LIVE: overwrite licenses_LIVE.db ────────────────────────────────
+        if upload_live:
+            live_media = MediaFileUpload(tmp_snap,
+                                         mimetype="application/octet-stream",
+                                         resumable=False)
+            live_id = _gdrive_find_file(service, _GDRIVE_LIVE_NAME, folder_id)
+            if live_id:
+                service.files().update(fileId=live_id,
+                                       media_body=live_media).execute()
+            else:
+                meta = {"name": _GDRIVE_LIVE_NAME}
+                if folder_id: meta["parents"] = [folder_id]
+                service.files().create(body=meta,
+                                       media_body=live_media,
+                                       fields="id").execute()
+            print(f"  [BACKUP] ✓ {_GDRIVE_LIVE_NAME} updated")
+            results["live"] = _GDRIVE_LIVE_NAME
+
+        # ── HIST: create licenses_PREV_YYYYMMDD_HHMMSS.db ───────────────────
+        if upload_hist:
+            ts_str    = time.strftime("%Y%m%d_%H%M%S")
+            prev_name = f"licenses_PREV_{ts_str}.db"
+            prev_media = MediaFileUpload(tmp_snap,
+                                         mimetype="application/octet-stream",
+                                         resumable=False)
+            meta = {"name": prev_name}
+            if folder_id: meta["parents"] = [folder_id]
+            service.files().create(body=meta,
+                                   media_body=prev_media,
+                                   fields="id").execute()
+            print(f"  [BACKUP] ✓ {prev_name} created  (folder: {folder_id or 'root'})")
+            results["hist"] = prev_name
+
+        return {"ok": True, **results}
+
     except Exception as e:
         print(f"  [BACKUP] Google Drive upload failed: {e}")
+        return {"ok": False, "error": str(e)}
+    finally:
+        if snap_conn:
+            try: snap_conn.close()
+            except: pass
+        try: os.remove(tmp_snap)
+        except: pass
+
+# ═════════════════════════════════════════════════════════════════
+#  PUBLIC API — backup_db  (manual / pre-redeploy backup)
+# ═════════════════════════════════════════════════════════════════
+
+def backup_db(upload_live: bool = True, upload_hist: bool = True) -> dict:
+    """
+    Trigger an immediate full backup right now.
+    Runs synchronously (blocks until upload is done) — call before redeploy.
+
+    Returns dict:
+      { ok: True,  live: "licenses_LIVE.db", hist: "licenses_PREV_....db" }
+      { ok: False, error: "reason" }
+
+    upload_live: overwrite licenses_LIVE.db  (default True)
+    upload_hist: create   licenses_PREV_timestamp.db  (default True)
+
+    Currently implemented for: sqlite (with backup_gdrive=true)
+    Future providers (postgresql, mysql, mongodb) will export a dump here.
+    """
+    if _PROVIDER == "sqlite":
+        if not DATABASE_INFO.get("backup_gdrive", False):
+            return {"ok": False, "error": "backup_gdrive is false — enable it in DATABASE_INFO"}
+        # Run synchronously (not in background thread) so caller gets result
+        return _gdrive_upload(upload_live=upload_live, upload_hist=upload_hist)
+
+    # Future providers:
+    # elif _PROVIDER == "postgresql":
+    #     return _pg_dump_to_gdrive()
+    # elif _PROVIDER == "mysql":
+    #     return _mysql_dump_to_gdrive()
+    # elif _PROVIDER == "mongodb":
+    #     return _mongo_export_to_gdrive()
+
+    return {"ok": False, "error": f"backup_db not yet implemented for provider: {_PROVIDER}"}
 
 # ═════════════════════════════════════════════════════════════════
 #  PROVIDER: TURSO  (hosted SQLite via libsql)
