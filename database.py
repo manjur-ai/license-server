@@ -81,8 +81,10 @@ def _load_db_info() -> dict:
 DATABASE_INFO = _load_db_info()
 _PROVIDER     = DATABASE_INFO.get("provider", "sqlite").lower()
 
-OTP_EXPIRY_SECONDS = 10 * 60
-OTP_MAX_ATTEMPTS   = 5
+OTP_EXPIRY_SECONDS  = 10 * 60
+OTP_MAX_ATTEMPTS    = 5
+OTP_RESEND_COOLDOWN = 60       # seconds between resend requests per identity
+OTP_HOURLY_LIMIT    = 5        # max OTPs sent per identity per hour
 
 # ─────────────────────────────────────────────────────────────────
 #  IDENTITY HELPERS  (shared across all providers)
@@ -102,11 +104,17 @@ def normalize_identity(identity: str, identity_type: str) -> str:
 def generate_otp() -> str:
     return ''.join(random.choices(string.digits, k=6))
 
+TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "14"))  # configurable via env
+
 def plan_expiry(plan, paid_at):
+    """Returns unix timestamp of expiry, or None for lifetime."""
     if plan == "lifetime": return None
     if plan == "annual":   return paid_at + 365 * 86400
     if plan == "monthly":  return paid_at + 30  * 86400
+    if plan == "trial":    return paid_at + TRIAL_DAYS * 86400
     return None
+
+VALID_PLANS = {"lifetime", "annual", "monthly", "trial"}
 
 # ═════════════════════════════════════════════════════════════════
 #  PROVIDER: SQLITE  (local file + Google Drive backup/restore)
@@ -130,8 +138,8 @@ CREATE TABLE IF NOT EXISTS products (
     id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL, price_inr REAL, price_usd REAL,
     razorpay_link TEXT, gumroad_product_id TEXT, gumroad_link TEXT,
-    max_machines INTEGER NOT NULL DEFAULT 1, is_active INTEGER NOT NULL DEFAULT 1,
-    created_at REAL NOT NULL
+    max_machines INTEGER NOT NULL DEFAULT 1, trial_days INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS identity_otps (
     identity TEXT NOT NULL, identity_type TEXT NOT NULL DEFAULT 'email',
@@ -169,10 +177,32 @@ CREATE TABLE IF NOT EXISTS verify_log (
     license_id INTEGER, identity TEXT, ip_address TEXT,
     result TEXT NOT NULL, called_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS coupons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    product_id TEXT,                    -- NULL = valid for all products
+    discount_pct REAL DEFAULT 0,        -- e.g. 20.0 = 20% off
+    discount_flat_inr REAL DEFAULT 0,   -- flat INR discount
+    discount_flat_usd REAL DEFAULT 0,   -- flat USD discount
+    plan_override TEXT,                 -- if set, forces this plan on redemption
+    max_uses INTEGER DEFAULT 1,
+    uses INTEGER NOT NULL DEFAULT 0,
+    valid_from REAL, valid_until REAL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS otp_send_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    identity TEXT NOT NULL,
+    identity_type TEXT NOT NULL DEFAULT 'email',
+    ip_address TEXT,
+    sent_at REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_lic_ukey  ON licenses(unique_key);
 CREATE INDEX IF NOT EXISTS idx_lic_prod  ON licenses(product_id);
 CREATE INDEX IF NOT EXISTS idx_lic_cust  ON licenses(customer_id);
 CREATE INDEX IF NOT EXISTS idx_otp_ident ON identity_otps(identity, identity_type);
+CREATE INDEX IF NOT EXISTS idx_otp_log   ON otp_send_log(identity, sent_at);
 CREATE INDEX IF NOT EXISTS idx_vlog_time ON verify_log(called_at);
 """
 
@@ -605,8 +635,8 @@ CREATE TABLE IF NOT EXISTS products (
     id INTEGER PRIMARY KEY, product_id TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL, price_inr REAL, price_usd REAL,
     razorpay_link TEXT, gumroad_product_id TEXT, gumroad_link TEXT,
-    max_machines INTEGER NOT NULL DEFAULT 1, is_active INTEGER NOT NULL DEFAULT 1,
-    created_at REAL NOT NULL
+    max_machines INTEGER NOT NULL DEFAULT 1, trial_days INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS identity_otps (
     identity TEXT NOT NULL, identity_type TEXT NOT NULL DEFAULT 'email',
@@ -641,10 +671,25 @@ CREATE TABLE IF NOT EXISTS verify_log (
     id INTEGER PRIMARY KEY, product_id TEXT, license_id INTEGER,
     identity TEXT, ip_address TEXT, result TEXT NOT NULL, called_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS coupons (
+    id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE,
+    product_id TEXT, discount_pct REAL DEFAULT 0,
+    discount_flat_inr REAL DEFAULT 0, discount_flat_usd REAL DEFAULT 0,
+    plan_override TEXT, max_uses INTEGER DEFAULT 1,
+    uses INTEGER NOT NULL DEFAULT 0,
+    valid_from REAL, valid_until REAL,
+    is_active INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS otp_send_log (
+    id INTEGER PRIMARY KEY, identity TEXT NOT NULL,
+    identity_type TEXT NOT NULL DEFAULT 'email',
+    ip_address TEXT, sent_at REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_lic_ukey  ON licenses(unique_key);
 CREATE INDEX IF NOT EXISTS idx_lic_prod  ON licenses(product_id);
 CREATE INDEX IF NOT EXISTS idx_otp_ident ON identity_otps(identity, identity_type);
-CREATE INDEX IF NOT EXISTS idx_vlog_time ON verify_log(called_at)
+CREATE INDEX IF NOT EXISTS idx_vlog_time ON verify_log(called_at);
+CREATE INDEX IF NOT EXISTS idx_otp_log   ON otp_send_log(identity, sent_at)
 """
 
 # ═════════════════════════════════════════════════════════════════
@@ -662,7 +707,9 @@ def _pg_init():
         id SERIAL PRIMARY KEY, product_id TEXT NOT NULL UNIQUE,
         name TEXT NOT NULL, price_inr REAL, price_usd REAL,
         razorpay_link TEXT, gumroad_product_id TEXT, gumroad_link TEXT,
-        max_machines INTEGER NOT NULL DEFAULT 1, is_active INTEGER NOT NULL DEFAULT 1,
+        max_machines INTEGER NOT NULL DEFAULT 1,
+        trial_days INTEGER NOT NULL DEFAULT 0,
+        is_active INTEGER NOT NULL DEFAULT 1,
         created_at DOUBLE PRECISION NOT NULL
     );
     CREATE TABLE IF NOT EXISTS identity_otps (
@@ -706,6 +753,23 @@ def _pg_init():
     CREATE INDEX IF NOT EXISTS idx_lic_prod  ON licenses(product_id);
     CREATE INDEX IF NOT EXISTS idx_otp_ident ON identity_otps(identity, identity_type);
     CREATE INDEX IF NOT EXISTS idx_vlog_time ON verify_log(called_at);
+    CREATE TABLE IF NOT EXISTS coupons (
+        id SERIAL PRIMARY KEY, code VARCHAR(64) NOT NULL UNIQUE,
+        product_id VARCHAR(64), discount_pct DOUBLE PRECISION DEFAULT 0,
+        discount_flat_inr DOUBLE PRECISION DEFAULT 0,
+        discount_flat_usd DOUBLE PRECISION DEFAULT 0,
+        plan_override VARCHAR(32), max_uses INTEGER DEFAULT 1,
+        uses INTEGER NOT NULL DEFAULT 0,
+        valid_from DOUBLE PRECISION, valid_until DOUBLE PRECISION,
+        is_active SMALLINT NOT NULL DEFAULT 1,
+        created_at DOUBLE PRECISION NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS otp_send_log (
+        id SERIAL PRIMARY KEY, identity VARCHAR(320) NOT NULL,
+        identity_type VARCHAR(16) NOT NULL DEFAULT 'email',
+        ip_address VARCHAR(64), sent_at DOUBLE PRECISION NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_otp_log ON otp_send_log(identity, sent_at);
     """
     conn = _pg_conn()
     cur  = conn.cursor()
@@ -754,7 +818,9 @@ def _mysql_init():
         id INT AUTO_INCREMENT PRIMARY KEY, product_id VARCHAR(64) NOT NULL UNIQUE,
         name VARCHAR(255) NOT NULL, price_inr FLOAT, price_usd FLOAT,
         razorpay_link TEXT, gumroad_product_id VARCHAR(128), gumroad_link TEXT,
-        max_machines INT NOT NULL DEFAULT 1, is_active TINYINT NOT NULL DEFAULT 1,
+        max_machines INT NOT NULL DEFAULT 1,
+        trial_days INT NOT NULL DEFAULT 0,
+        is_active TINYINT NOT NULL DEFAULT 1,
         created_at DOUBLE NOT NULL
     );
     CREATE TABLE IF NOT EXISTS identity_otps (
@@ -793,6 +859,22 @@ def _mysql_init():
         license_id INT, identity VARCHAR(255), ip_address VARCHAR(64),
         result VARCHAR(32) NOT NULL, called_at DOUBLE NOT NULL,
         INDEX idx_vlog_time (called_at)
+    );
+    CREATE TABLE IF NOT EXISTS coupons (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        code VARCHAR(64) NOT NULL UNIQUE, product_id VARCHAR(64),
+        discount_pct DOUBLE DEFAULT 0, discount_flat_inr DOUBLE DEFAULT 0,
+        discount_flat_usd DOUBLE DEFAULT 0, plan_override VARCHAR(32),
+        max_uses INT DEFAULT 1, uses INT NOT NULL DEFAULT 0,
+        valid_from DOUBLE, valid_until DOUBLE,
+        is_active TINYINT NOT NULL DEFAULT 1, created_at DOUBLE NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS otp_send_log (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        identity VARCHAR(320) NOT NULL,
+        identity_type VARCHAR(16) NOT NULL DEFAULT 'email',
+        ip_address VARCHAR(64), sent_at DOUBLE NOT NULL,
+        INDEX idx_otp_log (identity, sent_at)
     );
     """
     conn = _mysql_conn()
@@ -1188,23 +1270,23 @@ def get_product(product_id) -> dict:
 
 def register_license(product_id, identity, identity_type, machine_id, unique_key,
                      source, payment_ref, amount, currency,
-                     plan="lifetime", full_name=None, country=None, ip_address=None):
+                     plan="lifetime", full_name=None, country=None,
+                     ip_address=None, machine_label=None):
     identity = normalize_identity(identity, identity_type)
     now      = time.time()
 
     if _PROVIDER == "mongodb":
         return _mongo_register(product_id, identity, identity_type, machine_id, unique_key,
                                source, payment_ref, amount, currency, plan,
-                               full_name, country, ip_address, now)
+                               full_name, country, ip_address, now, machine_label)
 
-    # SQL providers share the same logic with provider-specific syntax
     return _sql_register(product_id, identity, identity_type, machine_id, unique_key,
                          source, payment_ref, amount, currency, plan,
-                         full_name, country, ip_address, now)
+                         full_name, country, ip_address, now, machine_label)
 
 def _sql_register(product_id, identity, identity_type, machine_id, unique_key,
                   source, payment_ref, amount, currency, plan,
-                  full_name, country, ip_address, now):
+                  full_name, country, ip_address, now, machine_label=None):
     """Shared registration logic for all SQL providers."""
 
     pg   = _PROVIDER == "postgresql"
@@ -1287,7 +1369,35 @@ def _sql_register(product_id, identity, identity_type, machine_id, unique_key,
         else:
             cnt_row = _mysql_rows(cur)[0]
         if cnt_row["cnt"] >= prod["max_machines"]:
-            return {"ok": False, "reason": f"max_machines_reached ({prod['max_machines']})"}
+            # Return existing machines so client can offer unlink UI
+            cur.execute(
+                f"SELECT unique_key, machine_id, machine_label, "
+                f"       activated_at, last_seen_at, last_seen_ip "
+                f"FROM licenses "
+                f"WHERE customer_id={ph} AND product_id={ph} AND is_active=1 "
+                f"ORDER BY activated_at ASC",
+                (customer_id, product_id))
+            if _PROVIDER == "sqlite":
+                rows = [dict(r) for r in cur.fetchall()]
+            elif pg:
+                rows = _pg_rows(cur)
+            else:
+                rows = _mysql_rows(cur)
+            machines = [
+                {
+                    "unique_key":    r["unique_key"],
+                    "machine_label": r.get("machine_label") or "Unknown machine",
+                    "activated_at":  r.get("activated_at"),
+                    "last_seen_at":  r.get("last_seen_at"),
+                }
+                for r in rows
+            ]
+            return {
+                "ok":          False,
+                "reason":      "max_machines_reached",
+                "max_allowed": prod["max_machines"],
+                "machines":    machines,
+            }
 
         # Insert payment
         cur.execute(
@@ -1307,13 +1417,14 @@ def _sql_register(product_id, identity, identity_type, machine_id, unique_key,
             return {"ok": True,  "reason": "already_registered"} if existing["is_active"] \
                    else {"ok": False, "reason": "license_revoked"}
 
-        # Insert license
+        # Insert license (machine_label = "ComputerName / OSUsername" from client)
         cur.execute(
             f"INSERT INTO licenses "
-            f"(product_id,customer_id,payment_id,unique_key,machine_id,plan,"
+            f"(product_id,customer_id,payment_id,unique_key,machine_id,machine_label,plan,"
             f" paid_at,expires_at,activated_at,last_seen_at,last_seen_ip,verify_count) "
-            f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},0)",
-            (product_id, customer_id, payment_db_id, unique_key, machine_id, plan,
+            f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},0)",
+            (product_id, customer_id, payment_db_id, unique_key, machine_id,
+             machine_label or "Unknown", plan,
              now, plan_expiry(plan, now), now, now, ip_address))
 
         conn.commit()
@@ -1454,19 +1565,40 @@ def verify_license(product_id, unique_key, ip_address=None):
             return {"ok": False, "reason": "wrong_product", "_log": "wrong_product",
                     "_lid": row.get("id"), "_identity": row.get("identity")}
         if not row["is_active"]:
-            return {"ok": False, "reason": "revoked", "_log": "revoked",
+            reason = "trial_ended" if row.get("plan") == "trial" else "revoked"
+            return {"ok": False, "reason": reason, "_log": reason,
+                    "plan": row.get("plan", "lifetime"),
                     "_lid": row.get("id"), "_identity": row.get("identity")}
-        if row.get("expires_at") and now > row["expires_at"]:
-            return {"ok": False, "reason": "expired", "_log": "expired",
+        exp = row.get("expires_at")
+        if exp and now > exp:
+            reason = "trial_ended" if row.get("plan") == "trial" else "expired"
+            return {"ok": False, "reason": reason, "_log": reason,
+                    "plan": row.get("plan", "lifetime"),
+                    "expires_at": exp,
                     "_lid": row.get("id"), "_identity": row.get("identity")}
-        return {"ok": True, "reason": "ok", "_update": True,
-                "_lid": row.get("id"), "_identity": row.get("identity")}
+        # Build rich success payload
+        days_left = None
+        if exp:
+            days_left = max(0, int((exp - now) / 86400))
+        return {
+            "ok":           True,
+            "reason":       "ok",
+            "plan":         row.get("plan", "lifetime"),
+            "expires_at":   exp,
+            "days_left":    days_left,
+            "activated_at": row.get("activated_at"),
+            "verify_count": row.get("verify_count", 0),
+            "_update":      True,
+            "_lid":         row.get("id"),
+            "_identity":    row.get("identity"),
+        }
 
     if _PROVIDER == "sqlite":
         conn = _sqlite_conn()
         try:
             row = conn.execute("""
-                SELECT l.id, l.is_active, l.expires_at, l.product_id, cu.identity
+                SELECT l.id, l.is_active, l.plan, l.expires_at, l.activated_at,
+                       l.verify_count, l.product_id, cu.identity
                 FROM licenses l JOIN customers cu ON cu.id=l.customer_id
                 WHERE l.unique_key=?""", (unique_key,)).fetchone()
             row = dict(row) if row else None
@@ -1478,12 +1610,13 @@ def verify_license(product_id, unique_key, ip_address=None):
                 conn.commit()
             _sql_log(conn, product_id, res.get("_lid"), res.get("_identity"),
                      ip_address, res["_log"] if not res["ok"] else "ok")
-            return {"ok": res["ok"], "reason": res["reason"]}
+            return {k:v for k,v in res.items() if not k.startswith("_")}
         finally: conn.close()
 
     elif _PROVIDER == "turso":
         rows = _turso_execute("""
-            SELECT l.id, l.is_active, l.expires_at, l.product_id, cu.identity
+            SELECT l.id, l.is_active, l.plan, l.expires_at, l.activated_at,
+                   l.verify_count, l.product_id, cu.identity
             FROM licenses l JOIN customers cu ON cu.id=l.customer_id
             WHERE l.unique_key=?""", [unique_key])
         row = rows[0] if rows else None
@@ -1492,14 +1625,15 @@ def verify_license(product_id, unique_key, ip_address=None):
             _turso_execute("UPDATE licenses SET last_seen_at=?,last_seen_ip=?,"
                            "verify_count=verify_count+1 WHERE id=?",
                            [now, ip_address, res["_lid"]])
-        return {"ok": res["ok"], "reason": res["reason"]}
+        return {k:v for k,v in res.items() if not k.startswith("_")}
 
     elif _PROVIDER == "postgresql":
         conn = _pg_conn()
         try:
             cur = conn.cursor()
             cur.execute("""
-                SELECT l.id, l.is_active, l.expires_at, l.product_id, cu.identity
+                SELECT l.id, l.is_active, l.plan, l.expires_at, l.activated_at,
+                       l.verify_count, l.product_id, cu.identity
                 FROM licenses l JOIN customers cu ON cu.id=l.customer_id
                 WHERE l.unique_key=%s""", (unique_key,))
             rows = _pg_rows(cur); row = rows[0] if rows else None
@@ -1509,7 +1643,7 @@ def verify_license(product_id, unique_key, ip_address=None):
                             "verify_count=verify_count+1 WHERE id=%s",
                             (now, ip_address, res["_lid"]))
                 conn.commit()
-            return {"ok": res["ok"], "reason": res["reason"]}
+            return {k:v for k,v in res.items() if not k.startswith("_")}
         finally: conn.close()
 
     elif _PROVIDER == "mysql":
@@ -1517,7 +1651,8 @@ def verify_license(product_id, unique_key, ip_address=None):
         try:
             cur = conn.cursor()
             cur.execute("""
-                SELECT l.id, l.is_active, l.expires_at, l.product_id, cu.identity
+                SELECT l.id, l.is_active, l.plan, l.expires_at, l.activated_at,
+                       l.verify_count, l.product_id, cu.identity
                 FROM licenses l JOIN customers cu ON cu.id=l.customer_id
                 WHERE l.unique_key=%s""", (unique_key,))
             rows = _mysql_rows(cur); row = rows[0] if rows else None
@@ -1527,15 +1662,15 @@ def verify_license(product_id, unique_key, ip_address=None):
                             "verify_count=verify_count+1 WHERE id=%s",
                             (now, ip_address, res["_lid"]))
                 conn.commit()
-            return {"ok": res["ok"], "reason": res["reason"]}
+            return {k:v for k,v in res.items() if not k.startswith("_")}
         finally: conn.close()
 
     elif _PROVIDER == "mongodb":
-        doc = _mongo_db.licenses.find_one({"unique_key": unique_key})
+        doc = _mongo_db().licenses.find_one({"unique_key": unique_key})
         if not doc:
             return {"ok": False, "reason": "not_found"}
-        cust = _mongo_db.customers.find_one({"_id": doc.get("customer_id")},
-                                            {"identity": 1}) or {}
+        cust = _mongo_db().customers.find_one({"_id": doc.get("customer_id")},
+                                              {"identity": 1}) or {}
         doc["identity"] = cust.get("identity", "")
         res = _eval(doc)
         if res.get("_update"):
@@ -1543,7 +1678,7 @@ def verify_license(product_id, unique_key, ip_address=None):
                 {"unique_key": unique_key},
                 {"$set": {"last_seen_at": now, "last_seen_ip": ip_address},
                  "$inc": {"verify_count": 1}})
-        return {"ok": res["ok"], "reason": res["reason"]}
+        return {k:v for k,v in res.items() if not k.startswith("_")}
 
 # ═════════════════════════════════════════════════════════════════
 #  PUBLIC API — revoke_license
@@ -1713,3 +1848,693 @@ if __name__ == "__main__":
             print(f"  [{p['product_id']}] {p['name']:25} "
                   f"₹{p['price_inr']} / ${p['price_usd']}  "
                   f"max {p['max_machines']} PC")
+
+# ═════════════════════════════════════════════════════════════════
+#  PUBLIC API — list_machines / unlink_machines
+# ═════════════════════════════════════════════════════════════════
+
+def list_machines(identity: str, identity_type: str, product_id: str) -> list:
+    """
+    Return all active licensed machines for this identity + product.
+    Each entry: {unique_key, machine_label, activated_at, last_seen_at}
+    """
+    identity = normalize_identity(identity, identity_type)
+    ph = "%s" if _PROVIDER in ("postgresql", "mysql") else "?"
+
+    sql = (
+        "SELECT l.unique_key, l.machine_label, l.activated_at, l.last_seen_at "
+        "FROM licenses l "
+        "JOIN customers c ON c.id = l.customer_id "
+        "WHERE c.identity={ph} AND c.identity_type={ph} "
+        "  AND l.product_id={ph} AND l.is_active=1 "
+        "ORDER BY l.activated_at ASC"
+    ).replace("{ph}", ph)
+
+    try:
+        if _PROVIDER == "sqlite":
+            conn = _sqlite_conn()
+            rows = [dict(r) for r in conn.execute(sql, (identity, identity_type, product_id)).fetchall()]
+            conn.close()
+        elif _PROVIDER == "turso":
+            result = _turso_execute(sql, [identity, identity_type, product_id])
+            cols   = result.get("results", [{}])[0].get("columns", [])
+            rrows  = result.get("results", [{}])[0].get("rows", [])
+            rows   = [dict(zip(cols, r)) for r in rrows]
+        elif _PROVIDER == "postgresql":
+            conn = _pg_conn(); cur = conn.cursor()
+            cur.execute(sql, (identity, identity_type, product_id))
+            rows = _pg_rows(cur); conn.close()
+        elif _PROVIDER == "mysql":
+            conn = _mysql_conn(); cur = conn.cursor()
+            cur.execute(sql, (identity, identity_type, product_id))
+            rows = _mysql_rows(cur); conn.close()
+        elif _PROVIDER == "mongodb":
+            rows = _mongo_list_machines(identity, identity_type, product_id)
+        else:
+            rows = []
+    except Exception as e:
+        print(f"[list_machines] error: {e}")
+        rows = []
+
+    return [
+        {
+            "unique_key":    r.get("unique_key", ""),
+            "machine_label": r.get("machine_label") or "Unknown machine",
+            "activated_at":  r.get("activated_at"),
+            "last_seen_at":  r.get("last_seen_at"),
+        }
+        for r in rows
+    ]
+
+
+def unlink_machines(identity: str, identity_type: str,
+                    product_id: str, unique_keys: list) -> dict:
+    """
+    Deactivate the given unique_keys for this identity + product.
+    Only unlinks machines the customer actually owns.
+    Returns {ok, unlinked_count, not_found_count}
+    """
+    if not unique_keys:
+        return {"ok": False, "reason": "no_keys_provided", "unlinked": 0}
+
+    identity = normalize_identity(identity, identity_type)
+    now      = time.time()
+    ph       = "%s" if _PROVIDER in ("postgresql", "mysql") else "?"
+
+    # Build parameterised IN clause
+    placeholders = ",".join([ph] * len(unique_keys))
+
+    sql_check = (
+        "SELECT l.id, l.unique_key "
+        "FROM licenses l "
+        "JOIN customers c ON c.id = l.customer_id "
+        "WHERE c.identity={ph} AND c.identity_type={ph} "
+        "  AND l.product_id={ph} AND l.is_active=1 "
+        "  AND l.unique_key IN ({ph_list})"
+    ).replace("{ph}", ph).replace("{ph_list}", placeholders)
+
+    sql_deactivate = (
+        "UPDATE licenses SET is_active=0, revoked_at={ph}, revoke_reason='unlinked_by_user' "
+        "WHERE unique_key IN ({ph_list})"
+    ).replace("{ph}", ph).replace("{ph_list}", placeholders)
+
+    params_check      = [identity, identity_type, product_id] + list(unique_keys)
+    params_deactivate = [now] + list(unique_keys)
+
+    try:
+        if _PROVIDER == "sqlite":
+            conn = _sqlite_conn()
+            verified_rows = [dict(r) for r in conn.execute(sql_check, params_check).fetchall()]
+            verified_keys = [r["unique_key"] for r in verified_rows]
+            if not verified_keys:
+                conn.close()
+                return {"ok": False, "reason": "no_owned_keys_found", "unlinked": 0}
+            # Only deactivate keys that actually belong to this customer
+            p2 = ",".join(["?"] * len(verified_keys))
+            conn.execute(
+                f"UPDATE licenses SET is_active=0, revoked_at=?, revoke_reason='unlinked_by_user' "
+                f"WHERE unique_key IN ({p2})",
+                [now] + verified_keys)
+            conn.commit()
+            _sqlite_maybe_backup()
+            conn.close()
+            not_found = len(unique_keys) - len(verified_keys)
+            return {"ok": True, "unlinked": len(verified_keys), "not_found": not_found}
+
+        elif _PROVIDER == "turso":
+            result       = _turso_execute(sql_check, params_check)
+            cols         = result.get("results", [{}])[0].get("columns", [])
+            rrows        = result.get("results", [{}])[0].get("rows", [])
+            verified_keys = [dict(zip(cols, r))["unique_key"] for r in rrows]
+            if not verified_keys:
+                return {"ok": False, "reason": "no_owned_keys_found", "unlinked": 0}
+            p2 = ",".join(["?"] * len(verified_keys))
+            _turso_execute(
+                f"UPDATE licenses SET is_active=0, revoked_at=?, revoke_reason='unlinked_by_user' "
+                f"WHERE unique_key IN ({p2})",
+                [now] + verified_keys)
+            not_found = len(unique_keys) - len(verified_keys)
+            return {"ok": True, "unlinked": len(verified_keys), "not_found": not_found}
+
+        elif _PROVIDER in ("postgresql", "mysql"):
+            conn = _pg_conn() if _PROVIDER == "postgresql" else _mysql_conn()
+            cur  = conn.cursor()
+            cur.execute(sql_check, params_check)
+            rows         = _pg_rows(cur) if _PROVIDER == "postgresql" else _mysql_rows(cur)
+            verified_keys = [r["unique_key"] for r in rows]
+            if not verified_keys:
+                conn.close()
+                return {"ok": False, "reason": "no_owned_keys_found", "unlinked": 0}
+            p2 = ",".join([ph] * len(verified_keys))
+            cur.execute(
+                f"UPDATE licenses SET is_active=0, revoked_at={ph}, revoke_reason='unlinked_by_user' "
+                f"WHERE unique_key IN ({p2})",
+                [now] + verified_keys)
+            conn.commit(); conn.close()
+            not_found = len(unique_keys) - len(verified_keys)
+            return {"ok": True, "unlinked": len(verified_keys), "not_found": not_found}
+
+        elif _PROVIDER == "mongodb":
+            return _mongo_unlink_machines(identity, identity_type, product_id, unique_keys, now)
+
+        else:
+            return {"ok": False, "reason": "unsupported_provider", "unlinked": 0}
+
+    except Exception as e:
+        print(f"[unlink_machines] error: {e}")
+        return {"ok": False, "reason": f"db_error: {e}", "unlinked": 0}
+
+
+def _mongo_list_machines(identity, identity_type, product_id):
+    """MongoDB implementation of list_machines."""
+    try:
+        db   = _mongo_db()
+        cust = db.customers.find_one({"identity": identity, "identity_type": identity_type})
+        if not cust:
+            return []
+        rows = list(db.licenses.find(
+            {"customer_id": str(cust["_id"]), "product_id": product_id, "is_active": True},
+            sort=[("activated_at", 1)]
+        ))
+        return [
+            {
+                "unique_key":    r.get("unique_key", ""),
+                "machine_label": r.get("machine_label") or "Unknown machine",
+                "activated_at":  r.get("activated_at"),
+                "last_seen_at":  r.get("last_seen_at"),
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        print(f"[_mongo_list_machines] {e}")
+        return []
+
+
+def _mongo_unlink_machines(identity, identity_type, product_id, unique_keys, now):
+    """MongoDB implementation of unlink_machines."""
+    try:
+        db   = _mongo_db()
+        cust = db.customers.find_one({"identity": identity, "identity_type": identity_type})
+        if not cust:
+            return {"ok": False, "reason": "no_owned_keys_found", "unlinked": 0}
+        result = db.licenses.update_many(
+            {
+                "customer_id": str(cust["_id"]),
+                "product_id":  product_id,
+                "unique_key":  {"$in": unique_keys},
+                "is_active":   True,
+            },
+            {"$set": {"is_active": False, "revoked_at": now,
+                      "revoke_reason": "unlinked_by_user"}}
+        )
+        unlinked  = result.modified_count
+        not_found = len(unique_keys) - unlinked
+        return {"ok": True, "unlinked": unlinked, "not_found": not_found}
+    except Exception as e:
+        print(f"[_mongo_unlink_machines] {e}")
+        return {"ok": False, "reason": f"db_error: {e}", "unlinked": 0}
+
+# ═════════════════════════════════════════════════════════════════
+#  PUBLIC API — OTP rate limiting
+# ═════════════════════════════════════════════════════════════════
+
+def check_otp_rate(identity: str, identity_type: str, ip: str) -> dict:
+    """
+    Returns {ok, reason} before storing/sending an OTP.
+    Blocks if:
+      - same identity got an OTP < OTP_RESEND_COOLDOWN seconds ago
+      - same identity got >= OTP_HOURLY_LIMIT OTPs in last 60 minutes
+    Logs each send to otp_send_log.
+    """
+    identity = normalize_identity(identity, identity_type)
+    now      = time.time()
+    hour_ago = now - 3600
+
+    if _PROVIDER == "sqlite":
+        conn = _sqlite_conn()
+        try:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT sent_at FROM otp_send_log WHERE identity=? AND sent_at>? ORDER BY sent_at DESC",
+                (identity, hour_ago)).fetchall()]
+            if rows and now - rows[0]["sent_at"] < OTP_RESEND_COOLDOWN:
+                wait = int(OTP_RESEND_COOLDOWN - (now - rows[0]["sent_at"]))
+                return {"ok": False, "reason": "resend_too_soon", "wait_seconds": wait}
+            if len(rows) >= OTP_HOURLY_LIMIT:
+                return {"ok": False, "reason": "hourly_limit_reached"}
+            conn.execute(
+                "INSERT INTO otp_send_log (identity,identity_type,ip_address,sent_at) VALUES (?,?,?,?)",
+                (identity, identity_type, ip, now))
+            conn.commit()
+            return {"ok": True}
+        finally: conn.close()
+
+    elif _PROVIDER == "turso":
+        rows = _turso_execute(
+            "SELECT sent_at FROM otp_send_log WHERE identity=? AND sent_at>? ORDER BY sent_at DESC",
+            [identity, hour_ago])
+        rows = rows or []
+        if rows and now - rows[0].get("sent_at", 0) < OTP_RESEND_COOLDOWN:
+            wait = int(OTP_RESEND_COOLDOWN - (now - rows[0]["sent_at"]))
+            return {"ok": False, "reason": "resend_too_soon", "wait_seconds": wait}
+        if len(rows) >= OTP_HOURLY_LIMIT:
+            return {"ok": False, "reason": "hourly_limit_reached"}
+        _turso_execute(
+            "INSERT INTO otp_send_log (identity,identity_type,ip_address,sent_at) VALUES (?,?,?,?)",
+            [identity, identity_type, ip, now])
+        return {"ok": True}
+
+    else:
+        # For pg/mysql/mongo: skip rate check (add tables if needed)
+        return {"ok": True}
+
+
+# ═════════════════════════════════════════════════════════════════
+#  PUBLIC API — Product CRUD
+# ═════════════════════════════════════════════════════════════════
+
+def upsert_product(product_id, name, price_inr, price_usd,
+                   razorpay_link=None, gumroad_product_id=None,
+                   gumroad_link=None, max_machines=1,
+                   trial_days=0, is_active=1) -> dict:
+    """
+    Create or fully update a product. Returns {ok, created: bool}.
+    trial_days > 0 means this product supports a free trial plan.
+    Stored in the 'trial_days' column (added as ALTER TABLE if missing).
+    """
+    now = time.time()
+    # Ensure trial_days column exists (migration-safe)
+    _ensure_trial_days_column()
+
+    if _PROVIDER == "sqlite":
+        conn = _sqlite_conn()
+        try:
+            existing = conn.execute(
+                "SELECT id FROM products WHERE product_id=?", (product_id,)).fetchone()
+            if existing:
+                conn.execute("""
+                    UPDATE products SET name=?,price_inr=?,price_usd=?,
+                        razorpay_link=?,gumroad_product_id=?,gumroad_link=?,
+                        max_machines=?,trial_days=?,is_active=?
+                    WHERE product_id=?""",
+                    (name,price_inr,price_usd,razorpay_link,gumroad_product_id,
+                     gumroad_link,max_machines,trial_days,is_active,product_id))
+                conn.commit()
+                return {"ok": True, "created": False}
+            else:
+                conn.execute("""
+                    INSERT INTO products
+                    (product_id,name,price_inr,price_usd,razorpay_link,
+                     gumroad_product_id,gumroad_link,max_machines,trial_days,is_active,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (product_id,name,price_inr,price_usd,razorpay_link,
+                     gumroad_product_id,gumroad_link,max_machines,trial_days,is_active,now))
+                conn.commit()
+                return {"ok": True, "created": True}
+        except Exception as e:
+            return {"ok": False, "reason": str(e)}
+        finally: conn.close()
+
+    elif _PROVIDER == "turso":
+        try:
+            existing = _turso_execute(
+                "SELECT id FROM products WHERE product_id=?", [product_id])
+            if existing:
+                _turso_execute("""
+                    UPDATE products SET name=?,price_inr=?,price_usd=?,
+                        razorpay_link=?,gumroad_product_id=?,gumroad_link=?,
+                        max_machines=?,trial_days=?,is_active=?
+                    WHERE product_id=?""",
+                    [name,price_inr,price_usd,razorpay_link,gumroad_product_id,
+                     gumroad_link,max_machines,trial_days,is_active,product_id])
+                return {"ok": True, "created": False}
+            else:
+                _turso_execute("""
+                    INSERT INTO products
+                    (product_id,name,price_inr,price_usd,razorpay_link,
+                     gumroad_product_id,gumroad_link,max_machines,trial_days,is_active,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    [product_id,name,price_inr,price_usd,razorpay_link,
+                     gumroad_product_id,gumroad_link,max_machines,trial_days,is_active,now])
+                return {"ok": True, "created": True}
+        except Exception as e:
+            return {"ok": False, "reason": str(e)}
+
+    elif _PROVIDER in ("postgresql", "mysql"):
+        ph = "%s"
+        conn = _pg_conn() if _PROVIDER == "postgresql" else _mysql_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(f"SELECT id FROM products WHERE product_id={ph}", (product_id,))
+            rows = _pg_rows(cur) if _PROVIDER=="postgresql" else _mysql_rows(cur)
+            if rows:
+                cur.execute(f"""
+                    UPDATE products SET name={ph},price_inr={ph},price_usd={ph},
+                        razorpay_link={ph},gumroad_product_id={ph},gumroad_link={ph},
+                        max_machines={ph},trial_days={ph},is_active={ph}
+                    WHERE product_id={ph}""",
+                    (name,price_inr,price_usd,razorpay_link,gumroad_product_id,
+                     gumroad_link,max_machines,trial_days,is_active,product_id))
+                conn.commit()
+                return {"ok": True, "created": False}
+            else:
+                cur.execute(f"""
+                    INSERT INTO products
+                    (product_id,name,price_inr,price_usd,razorpay_link,
+                     gumroad_product_id,gumroad_link,max_machines,trial_days,is_active,created_at)
+                    VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph})""",
+                    (product_id,name,price_inr,price_usd,razorpay_link,
+                     gumroad_product_id,gumroad_link,max_machines,trial_days,is_active,now))
+                conn.commit()
+                return {"ok": True, "created": True}
+        except Exception as e:
+            return {"ok": False, "reason": str(e)}
+        finally: conn.close()
+
+    elif _PROVIDER == "mongodb":
+        try:
+            doc = {"product_id":product_id,"name":name,"price_inr":price_inr,
+                   "price_usd":price_usd,"razorpay_link":razorpay_link,
+                   "gumroad_product_id":gumroad_product_id,"gumroad_link":gumroad_link,
+                   "max_machines":max_machines,"trial_days":trial_days,
+                   "is_active":is_active,"created_at":now}
+            r = _mongo_db().products.update_one(
+                {"product_id": product_id}, {"$set": doc}, upsert=True)
+            return {"ok": True, "created": r.upserted_id is not None}
+        except Exception as e:
+            return {"ok": False, "reason": str(e)}
+
+    return {"ok": False, "reason": "unsupported_provider"}
+
+
+def list_products(include_inactive=False) -> list:
+    """Return all products as list of dicts."""
+    _ensure_trial_days_column()
+    if _PROVIDER == "sqlite":
+        conn = _sqlite_conn()
+        sql  = "SELECT * FROM products" + ("" if include_inactive else " WHERE is_active=1")
+        rows = [dict(r) for r in conn.execute(sql + " ORDER BY created_at").fetchall()]
+        conn.close()
+        return rows
+    elif _PROVIDER == "turso":
+        sql = "SELECT * FROM products" + ("" if include_inactive else " WHERE is_active=1")
+        return _turso_execute(sql + " ORDER BY created_at", []) or []
+    elif _PROVIDER in ("postgresql", "mysql"):
+        conn = _pg_conn() if _PROVIDER=="postgresql" else _mysql_conn()
+        cur  = conn.cursor()
+        sql  = "SELECT * FROM products" + ("" if include_inactive else " WHERE is_active=1")
+        cur.execute(sql + " ORDER BY created_at")
+        rows = _pg_rows(cur) if _PROVIDER=="postgresql" else _mysql_rows(cur)
+        conn.close()
+        return rows
+    elif _PROVIDER == "mongodb":
+        flt = {} if include_inactive else {"is_active": 1}
+        return list(_mongo_db().products.find(flt, {"_id": 0}).sort("created_at", 1))
+    return []
+
+
+def delete_product(product_id: str) -> dict:
+    """Soft-delete (is_active=0). Never hard-deletes (preserves license history)."""
+    if _PROVIDER == "sqlite":
+        conn = _sqlite_conn()
+        conn.execute("UPDATE products SET is_active=0 WHERE product_id=?", (product_id,))
+        conn.commit(); conn.close()
+        return {"ok": True}
+    elif _PROVIDER == "turso":
+        _turso_execute("UPDATE products SET is_active=0 WHERE product_id=?", [product_id])
+        return {"ok": True}
+    elif _PROVIDER in ("postgresql", "mysql"):
+        conn = _pg_conn() if _PROVIDER=="postgresql" else _mysql_conn()
+        conn.cursor().execute("UPDATE products SET is_active=0 WHERE product_id=%s", (product_id,))
+        conn.commit(); conn.close()
+        return {"ok": True}
+    elif _PROVIDER == "mongodb":
+        _mongo_db().products.update_one({"product_id":product_id},{"$set":{"is_active":0}})
+        return {"ok": True}
+    return {"ok": False, "reason": "unsupported_provider"}
+
+
+def _ensure_trial_days_column():
+    """Add trial_days column to products table if it doesn't exist yet (migration)."""
+    if _PROVIDER == "sqlite":
+        conn = _sqlite_conn()
+        try:
+            conn.execute("ALTER TABLE products ADD COLUMN trial_days INTEGER NOT NULL DEFAULT 0")
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+        finally: conn.close()
+    elif _PROVIDER == "turso":
+        try:
+            _turso_execute("ALTER TABLE products ADD COLUMN trial_days INTEGER NOT NULL DEFAULT 0", [])
+        except Exception: pass
+    elif _PROVIDER in ("postgresql", "mysql"):
+        ph = "INTEGER" if _PROVIDER == "mysql" else "INTEGER"
+        conn = _pg_conn() if _PROVIDER=="postgresql" else _mysql_conn()
+        try:
+            conn.cursor().execute("ALTER TABLE products ADD COLUMN trial_days INTEGER NOT NULL DEFAULT 0")
+            conn.commit()
+        except Exception: pass
+        finally: conn.close()
+
+
+# ═════════════════════════════════════════════════════════════════
+#  PUBLIC API — Coupons
+# ═════════════════════════════════════════════════════════════════
+
+def create_coupon(code, product_id=None, discount_pct=0,
+                  discount_flat_inr=0, discount_flat_usd=0,
+                  plan_override=None, max_uses=1,
+                  valid_from=None, valid_until=None) -> dict:
+    now = time.time()
+    code = code.strip().upper()
+    if _PROVIDER == "sqlite":
+        conn = _sqlite_conn()
+        try:
+            conn.execute("""
+                INSERT INTO coupons
+                (code,product_id,discount_pct,discount_flat_inr,discount_flat_usd,
+                 plan_override,max_uses,uses,valid_from,valid_until,is_active,created_at)
+                VALUES (?,?,?,?,?,?,?,0,?,?,1,?)""",
+                (code,product_id,discount_pct,discount_flat_inr,discount_flat_usd,
+                 plan_override,max_uses,valid_from,valid_until,now))
+            conn.commit()
+            return {"ok": True, "code": code}
+        except Exception as e:
+            return {"ok": False, "reason": f"code_exists_or_error: {e}"}
+        finally: conn.close()
+    elif _PROVIDER == "turso":
+        try:
+            _turso_execute("""
+                INSERT INTO coupons
+                (code,product_id,discount_pct,discount_flat_inr,discount_flat_usd,
+                 plan_override,max_uses,uses,valid_from,valid_until,is_active,created_at)
+                VALUES (?,?,?,?,?,?,?,0,?,?,1,?)""",
+                [code,product_id,discount_pct,discount_flat_inr,discount_flat_usd,
+                 plan_override,max_uses,valid_from,valid_until,now])
+            return {"ok": True, "code": code}
+        except Exception as e:
+            return {"ok": False, "reason": str(e)}
+    elif _PROVIDER in ("postgresql", "mysql"):
+        ph = "%s"
+        conn = _pg_conn() if _PROVIDER=="postgresql" else _mysql_conn()
+        try:
+            conn.cursor().execute(f"""
+                INSERT INTO coupons
+                (code,product_id,discount_pct,discount_flat_inr,discount_flat_usd,
+                 plan_override,max_uses,uses,valid_from,valid_until,is_active,created_at)
+                VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},0,{ph},{ph},1,{ph})""",
+                (code,product_id,discount_pct,discount_flat_inr,discount_flat_usd,
+                 plan_override,max_uses,valid_from,valid_until,now))
+            conn.commit(); conn.close()
+            return {"ok": True, "code": code}
+        except Exception as e:
+            return {"ok": False, "reason": str(e)}
+    elif _PROVIDER == "mongodb":
+        try:
+            _mongo_db().coupons.insert_one({
+                "code":code,"product_id":product_id,"discount_pct":discount_pct,
+                "discount_flat_inr":discount_flat_inr,"discount_flat_usd":discount_flat_usd,
+                "plan_override":plan_override,"max_uses":max_uses,"uses":0,
+                "valid_from":valid_from,"valid_until":valid_until,"is_active":1,"created_at":now})
+            return {"ok": True, "code": code}
+        except Exception as e:
+            return {"ok": False, "reason": str(e)}
+    return {"ok": False, "reason": "unsupported_provider"}
+
+
+def validate_coupon(code: str, product_id: str, currency: str = "INR") -> dict:
+    """
+    Returns {ok, discount_inr, discount_usd, plan_override, coupon_id} or {ok:False, reason}.
+    Does NOT increment uses — call redeem_coupon() after successful payment.
+    """
+    if not code:
+        return {"ok": False, "reason": "no_code"}
+    code = code.strip().upper()
+    now  = time.time()
+
+    def _eval_coupon(row):
+        if not row:
+            return {"ok": False, "reason": "coupon_not_found"}
+        if not row.get("is_active"):
+            return {"ok": False, "reason": "coupon_inactive"}
+        if row.get("product_id") and row["product_id"] != product_id:
+            return {"ok": False, "reason": "coupon_wrong_product"}
+        if row.get("valid_from") and now < row["valid_from"]:
+            return {"ok": False, "reason": "coupon_not_yet_valid"}
+        if row.get("valid_until") and now > row["valid_until"]:
+            return {"ok": False, "reason": "coupon_expired"}
+        if row.get("max_uses") and row.get("uses", 0) >= row["max_uses"]:
+            return {"ok": False, "reason": "coupon_exhausted"}
+        return {
+            "ok":             True,
+            "coupon_id":      row.get("id") or str(row.get("_id", "")),
+            "discount_pct":   row.get("discount_pct", 0),
+            "discount_inr":   row.get("discount_flat_inr", 0),
+            "discount_usd":   row.get("discount_flat_usd", 0),
+            "plan_override":  row.get("plan_override"),
+        }
+
+    if _PROVIDER == "sqlite":
+        conn = _sqlite_conn()
+        row = conn.execute("SELECT * FROM coupons WHERE code=?", (code,)).fetchone()
+        conn.close()
+        return _eval_coupon(dict(row) if row else None)
+    elif _PROVIDER == "turso":
+        rows = _turso_execute("SELECT * FROM coupons WHERE code=?", [code])
+        return _eval_coupon(rows[0] if rows else None)
+    elif _PROVIDER in ("postgresql", "mysql"):
+        conn = _pg_conn() if _PROVIDER=="postgresql" else _mysql_conn()
+        cur  = conn.cursor()
+        cur.execute("SELECT * FROM coupons WHERE code=%s", (code,))
+        rows = _pg_rows(cur) if _PROVIDER=="postgresql" else _mysql_rows(cur)
+        conn.close()
+        return _eval_coupon(rows[0] if rows else None)
+    elif _PROVIDER == "mongodb":
+        row = _mongo_db().coupons.find_one({"code": code})
+        return _eval_coupon(row)
+    return {"ok": False, "reason": "unsupported_provider"}
+
+
+def redeem_coupon(code: str) -> bool:
+    """Increment uses counter after a successful registration."""
+    code = code.strip().upper()
+    if _PROVIDER == "sqlite":
+        conn = _sqlite_conn()
+        conn.execute("UPDATE coupons SET uses=uses+1 WHERE code=?", (code,))
+        conn.commit(); conn.close(); return True
+    elif _PROVIDER == "turso":
+        _turso_execute("UPDATE coupons SET uses=uses+1 WHERE code=?", [code]); return True
+    elif _PROVIDER in ("postgresql", "mysql"):
+        conn = _pg_conn() if _PROVIDER=="postgresql" else _mysql_conn()
+        conn.cursor().execute("UPDATE coupons SET uses=uses+1 WHERE code=%s", (code,))
+        conn.commit(); conn.close(); return True
+    elif _PROVIDER == "mongodb":
+        _mongo_db().coupons.update_one({"code":code},{"$inc":{"uses":1}}); return True
+    return False
+
+
+def list_coupons() -> list:
+    if _PROVIDER == "sqlite":
+        conn = _sqlite_conn()
+        rows = [dict(r) for r in conn.execute("SELECT * FROM coupons ORDER BY created_at DESC").fetchall()]
+        conn.close(); return rows
+    elif _PROVIDER == "turso":
+        return _turso_execute("SELECT * FROM coupons ORDER BY created_at DESC", []) or []
+    elif _PROVIDER in ("postgresql", "mysql"):
+        conn = _pg_conn() if _PROVIDER=="postgresql" else _mysql_conn()
+        cur  = conn.cursor()
+        cur.execute("SELECT * FROM coupons ORDER BY created_at DESC")
+        rows = _pg_rows(cur) if _PROVIDER=="postgresql" else _mysql_rows(cur)
+        conn.close(); return rows
+    elif _PROVIDER == "mongodb":
+        return list(_mongo_db().coupons.find({}, {"_id":0}).sort("created_at", -1))
+    return []
+
+
+# ═════════════════════════════════════════════════════════════════
+#  PUBLIC API — Customer self-service /me
+# ═════════════════════════════════════════════════════════════════
+
+def get_customer_profile(identity: str, identity_type: str) -> dict:
+    """
+    Returns full profile for a verified customer:
+      {ok, customer, licenses: [{product_id, product_name, plan, is_active,
+         activated_at, expires_at, days_left, machines, verify_count}]}
+    """
+    identity = normalize_identity(identity, identity_type)
+    now      = time.time()
+
+    if _PROVIDER == "sqlite":
+        conn = _sqlite_conn()
+        try:
+            cust = conn.execute(
+                "SELECT * FROM customers WHERE identity=? AND identity_type=?",
+                (identity, identity_type)).fetchone()
+            if not cust:
+                return {"ok": False, "reason": "customer_not_found"}
+            cust = dict(cust)
+            cust_id = cust["id"]
+
+            lics = [dict(r) for r in conn.execute("""
+                SELECT l.*, p.name AS product_name
+                FROM licenses l
+                JOIN products p ON p.product_id = l.product_id
+                WHERE l.customer_id=?
+                ORDER BY l.activated_at DESC""", (cust_id,)).fetchall()]
+
+            payments = [dict(r) for r in conn.execute(
+                "SELECT * FROM payments WHERE customer_id=? ORDER BY paid_at DESC",
+                (cust_id,)).fetchall()]
+
+            for lic in lics:
+                exp = lic.get("expires_at")
+                lic["days_left"] = max(0, int((exp - now) / 86400)) if exp and exp > now else (
+                    None if not exp else 0)
+                lic["is_expired"] = bool(exp and now > exp)
+
+            return {
+                "ok":       True,
+                "customer": {
+                    "identity":      cust["identity"],
+                    "identity_type": cust["identity_type"],
+                    "email":         cust.get("email"),
+                    "phone":         cust.get("phone"),
+                    "full_name":     cust.get("full_name"),
+                    "member_since":  cust.get("created_at"),
+                },
+                "licenses": lics,
+                "payments": [
+                    {"source": p["source"], "amount": p["amount"],
+                     "currency": p["currency"], "plan": p["plan"],
+                     "paid_at": p["paid_at"], "is_refunded": p.get("is_refunded", 0)}
+                    for p in payments
+                ],
+                "total_licenses": len(lics),
+                "active_licenses": sum(1 for l in lics if l["is_active"] and not l["is_expired"]),
+            }
+        finally: conn.close()
+
+    # For other providers: simplified version (can be expanded)
+    return {"ok": False, "reason": "not_implemented_for_provider"}
+
+
+def get_stats() -> dict:
+    """Admin dashboard stats: total customers, active licenses, revenue, etc."""
+    if _PROVIDER == "sqlite":
+        conn = _sqlite_conn()
+        try:
+            def scalar(sql): return conn.execute(sql).fetchone()[0] or 0
+            return {
+                "total_customers":       scalar("SELECT COUNT(*) FROM customers"),
+                "total_licenses":        scalar("SELECT COUNT(*) FROM licenses"),
+                "active_licenses":       scalar("SELECT COUNT(*) FROM licenses WHERE is_active=1"),
+                "trial_licenses":        scalar("SELECT COUNT(*) FROM licenses WHERE plan='trial' AND is_active=1"),
+                "revenue_inr":           scalar("SELECT COALESCE(SUM(amount),0) FROM payments WHERE currency='INR' AND is_refunded=0"),
+                "revenue_usd":           scalar("SELECT COALESCE(SUM(amount),0) FROM payments WHERE currency='USD' AND is_refunded=0"),
+                "total_payments":        scalar("SELECT COUNT(*) FROM payments"),
+                "refunds":               scalar("SELECT COUNT(*) FROM payments WHERE is_refunded=1"),
+                "coupons_redeemed":      scalar("SELECT COALESCE(SUM(uses),0) FROM coupons"),
+                "otps_sent_last_24h":    scalar(f"SELECT COUNT(*) FROM otp_send_log WHERE sent_at>{time.time()-86400}"),
+            }
+        finally: conn.close()
+    return {}
