@@ -93,7 +93,12 @@ def make_unique_key(product_id: str, identity: str, identity_type: str, machine_
 
 def send_email(to: str, subject: str, html_body: str) -> dict:
     """Returns SendResult dict: {ok, reason, provider}"""
-    return _send_email(to, subject, html_body, test_mode=TEST_MODE)
+    ok = _send_email(to, subject, html_body, test_mode=TEST_MODE)
+    return {
+        "ok":       ok,
+        "reason":   "sent" if ok else ("not_configured" if not EMAIL_SEND_METHODS else "all_methods_failed"),
+        "provider": "email",
+    }
 
 def notify_otp(identity: str, identity_type: str, otp: str, product_name: str) -> dict:
     """
@@ -106,7 +111,12 @@ def notify_otp(identity: str, identity_type: str, otp: str, product_name: str) -
       "all_methods_failed" — every configured provider failed to deliver
     """
     if identity_type == "sms":
-        return send_sms_otp(identity, otp, test_mode=TEST_MODE)
+        ok = send_sms_otp(identity, otp, test_mode=TEST_MODE)
+        return {
+            "ok":       ok,
+            "reason":   "sent" if ok else "all_methods_failed",
+            "provider": "sms",
+        }
     else:
         return send_email(
             to        = identity,

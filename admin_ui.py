@@ -100,8 +100,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="stat-grid" id="stats-grid"></div>
   <div class="card"><h2>Quick Actions</h2>
     <div class="form-row">
-      <div><label>Revoke license by email</label>
-        <input type="text" id="revoke-email" placeholder="user@example.com" style="width:280px"/>
+      <div><label>Revoke license by email or phone</label>
+        <input type="text" id="revoke-email" placeholder="user@example.com or +91..." style="width:280px"/>
+      </div>
+      <div><label>Identity type</label>
+        <select id="revoke-itype">
+          <option value="email">email</option>
+          <option value="sms">sms (phone)</option>
+        </select>
       </div>
       <div><label>Product ID (blank=all)</label>
         <input type="text" id="revoke-prod" placeholder="optional" style="width:140px"/>
@@ -359,7 +365,7 @@ async function saveCoupon() {
   });
   const m = document.getElementById('coup-msg');
   m.className='msg '+(r.ok?'msg-ok':'msg-err');
-  m.textContent = r.ok ? '✓ Coupon '+r.code+' created' : '✗ '+r.reason;
+  m.textContent = r.ok ? '✓ Coupon '+document.getElementById('c-code').value.trim().toUpperCase()+' created' : '✗ '+r.reason;
   if (r.ok) loadCoupons();
 }
 
@@ -367,7 +373,8 @@ async function revokeAction() {
   const email = document.getElementById('revoke-email').value.trim();
   if (!email) return;
   const r = await apiCall('/admin/revoke', {
-    identity: email, identity_type: 'email',
+    identity: email,
+    identity_type: document.getElementById('revoke-itype').value,
     product_id: document.getElementById('revoke-prod').value.trim()||null,
     reason: document.getElementById('revoke-reason').value,
   });
