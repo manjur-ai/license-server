@@ -217,8 +217,14 @@ async function apiCall(endpoint, body) {
 let _key = null;
 async function getKey() {
   if (_key) return _key;
-  const hexKey = document.cookie.split(';').find(c=>c.trim().startsWith('sk='))?.split('=')[1] || '';
-  if (!hexKey) throw new Error('no key');
+  // Primary: cookie set by server (works on HTTPS with secure=True, samesite=lax)
+  let hexKey = document.cookie.split(';').map(c=>c.trim()).find(c=>c.startsWith('sk='))?.split('=')[1] || '';
+  // Fallback: URL hash e.g. /admin/ui#sk=<64hexchars> — hash is never sent to server
+  if (!hexKey) {
+    const m = window.location.hash.match(/sk=([0-9a-fA-F]{64})/);
+    if (m) hexKey = m[1];
+  }
+  if (!hexKey) throw new Error('Encryption key not found. Refresh the page or use the #sk= URL method.');
   const raw = new Uint8Array(hexKey.match(/.{2}/g).map(b=>parseInt(b,16)));
   _key = await crypto.subtle.importKey('raw',raw,{name:'AES-GCM'},false,['encrypt','decrypt']);
   return _key;
@@ -246,6 +252,7 @@ function fmt_ts(ts) {
 
 async function load() {
   tok = document.getElementById('token').value;
+  _key = null;  // clear cached key so fresh cookie is always re-read
   document.getElementById('conn-status').textContent = 'Connecting…';
   try {
     const s = await apiCall('/admin/stats', {});
@@ -432,5 +439,6 @@ async def admin_ui(request: Request):
     response = HTMLResponse(DASHBOARD_HTML)
     sk_hex   = os.environ.get("SHARED_SECRET",
         "8cfaf7568ebd0d6f5557552efa46e43dfa57bb9618635753c224d3f38b3ac158")
-    response.set_cookie("sk", sk_hex, max_age=3600, samesite="strict", secure=False)
+    response.set_cookie("sk", sk_hex, max_age=3600, samesite="lax", secure=True,
+                        httponly=False)
     return response
