@@ -73,14 +73,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     padding:36px 40px;width:100%;max-width:420px;margin:auto}
   .login-box h2{color:#58a6ff;font-size:20px;font-weight:600;margin-bottom:8px}
   .login-box p.sub{color:#8b949e;font-size:13px;margin-bottom:28px}
-  .login-box input{width:100%;background:#0d1117;border:1px solid #30363d;color:#e6edf3;
-    padding:10px 14px;border-radius:6px;font-size:14px;margin-bottom:12px;display:block}
+  .login-box input{width:100%;background:#1c2128;border:2px solid #58a6ff;color:#e6edf3;
+    padding:10px 14px;border-radius:6px;font-size:14px;margin-bottom:16px;display:block}
+  .login-box input::placeholder{color:#8b949e}
   .login-box input:focus{outline:none;border-color:#58a6ff}
-  .login-box button{width:100%;padding:10px;border-radius:6px;border:none;
-    background:#238636;color:#fff;font-size:14px;font-weight:500;cursor:pointer;margin-top:4px}
+  .login-box button{width:100%;padding:12px;border-radius:6px;border:none;
+    background:#238636;color:#fff;font-size:15px;font-weight:600;cursor:pointer;margin-top:8px}
   .login-box button:hover:not(:disabled){background:#2ea043}
   .login-box button:disabled{background:#21262d;color:#8b949e;cursor:default}
-  #login-err{color:#f85149;font-size:13px;margin-bottom:12px;min-height:18px}
+  #login-err{color:#f85149;font-size:13px;margin-bottom:12px;min-height:20px;font-weight:500}
   #login-step2{display:none}
   .session-bar{font-size:12px;color:#8b949e;margin-left:auto;cursor:pointer}
   .session-bar:hover{color:#e6edf3}
