@@ -991,6 +991,126 @@ async def admin_backup_db(payload: Payload):
     return JSONResponse({"data": aes_encrypt(result)})
 
 
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ADMIN — READ-ONLY DATA BROWSER  (paginated, latest-first, 500 rows/page)
+# ═════════════════════════════════════════════════════════════════════════════
+
+import sqlite3 as _sqlite3
+
+def _sqlite_browse(sql_data: str, sql_count: str, params_data, params_count, offset: int, limit: int):
+    """Generic SQLite paginated fetch helper."""
+    try:
+        db_path = os.environ.get("DB_PATH", "licenses.db")
+        conn = _sqlite3.connect(db_path)
+        conn.row_factory = _sqlite3.Row
+        total = conn.execute(sql_count, params_count).fetchone()[0]
+        rows  = [dict(r) for r in conn.execute(sql_data, params_data).fetchall()]
+        conn.close()
+        return {"ok": True, "rows": rows, "total": total,
+                "offset": offset, "limit": limit,
+                "has_more": (offset + limit) < total}
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
+
+
+@app.post("/admin/browse/licenses")
+async def admin_browse_licenses(payload: Payload):
+    """
+    Read-only paginated license list. Latest activated first.
+    Sends: { admin_token, offset?, limit? }
+    Returns: { ok, rows, total, offset, limit, has_more }
+    Each row: product_id, identity, identity_type, plan, is_active,
+              activated_at, expires_at, last_seen_at, verify_count,
+              revoke_reason, source, amount, currency, machine_id
+    """
+    req = aes_decrypt(payload.data)
+    if not req or req.get("admin_token") != ADMIN_TOKEN:
+        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
+
+    offset = max(0, int(req.get("offset", 0)))
+    limit  = min(500, max(1, int(req.get("limit", 500))))
+
+    sql_data = """
+        SELECT l.product_id,
+               cu.identity, cu.identity_type,
+               l.plan, l.is_active, l.activated_at, l.expires_at,
+               l.last_seen_at, l.verify_count, l.revoke_reason,
+               l.machine_id, l.machine_label,
+               p.source, p.amount, p.currency, p.payment_ref
+        FROM licenses l
+        JOIN customers cu ON cu.id = l.customer_id
+        JOIN payments  p  ON p.id  = l.payment_id
+        ORDER BY l.activated_at DESC
+        LIMIT ? OFFSET ?
+    """
+    sql_count = "SELECT COUNT(*) FROM licenses"
+    result = _sqlite_browse(sql_data, sql_count, (limit, offset), (), offset, limit)
+    return JSONResponse({"data": aes_encrypt(result)})
+
+
+@app.post("/admin/browse/payments")
+async def admin_browse_payments(payload: Payload):
+    """
+    Read-only paginated payment list. Latest paid first.
+    Sends: { admin_token, offset?, limit? }
+    Returns: { ok, rows, total, offset, limit, has_more }
+    Each row: payment_ref, source, amount, currency, plan,
+              paid_at, is_refunded, identity, identity_type, product_id
+    """
+    req = aes_decrypt(payload.data)
+    if not req or req.get("admin_token") != ADMIN_TOKEN:
+        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
+
+    offset = max(0, int(req.get("offset", 0)))
+    limit  = min(500, max(1, int(req.get("limit", 500))))
+
+    sql_data = """
+        SELECT p.payment_ref, p.source, p.amount, p.currency, p.plan,
+               p.paid_at, p.is_refunded, p.refunded_at,
+               cu.identity, cu.identity_type, p.product_id
+        FROM payments p
+        JOIN customers cu ON cu.id = p.customer_id
+        ORDER BY p.paid_at DESC
+        LIMIT ? OFFSET ?
+    """
+    sql_count = "SELECT COUNT(*) FROM payments"
+    result = _sqlite_browse(sql_data, sql_count, (limit, offset), (), offset, limit)
+    return JSONResponse({"data": aes_encrypt(result)})
+
+
+@app.post("/admin/browse/customers")
+async def admin_browse_customers(payload: Payload):
+    """
+    Read-only paginated customer list. Newest first.
+    Sends: { admin_token, offset?, limit? }
+    Returns: { ok, rows, total, offset, limit, has_more }
+    Each row: identity, identity_type, created_at,
+              total_licenses, active_licenses
+    """
+    req = aes_decrypt(payload.data)
+    if not req or req.get("admin_token") != ADMIN_TOKEN:
+        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
+
+    offset = max(0, int(req.get("offset", 0)))
+    limit  = min(500, max(1, int(req.get("limit", 500))))
+
+    sql_data = """
+        SELECT cu.identity, cu.identity_type, cu.created_at,
+               COUNT(l.id)      AS total_licenses,
+               SUM(l.is_active) AS active_licenses
+        FROM customers cu
+        LEFT JOIN licenses l ON l.customer_id = cu.id
+        GROUP BY cu.id
+        ORDER BY cu.created_at DESC
+        LIMIT ? OFFSET ?
+    """
+    sql_count = "SELECT COUNT(*) FROM customers"
+    result = _sqlite_browse(sql_data, sql_count, (limit, offset), (), offset, limit)
+    return JSONResponse({"data": aes_encrypt(result)})
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  HEALTH
 # ═════════════════════════════════════════════════════════════════════════════

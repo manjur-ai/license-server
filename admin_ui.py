@@ -93,6 +93,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="tab" onclick="showTab('products')">Products</div>
   <div class="tab" onclick="showTab('coupons')">Coupons</div>
   <div class="tab" onclick="showTab('customers')">Customers</div>
+  <div class="tab" onclick="showTab('data')">📊 Data</div>
 </div>
 
 <!-- DASHBOARD -->
@@ -192,6 +193,73 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
     <div id="cust-result" style="margin-top:16px"></div>
   </div>
+</div>
+
+<!-- DATA BROWSER -->
+<div class="page" id="page-data">
+
+  <!-- Sub-tab bar -->
+  <div style="display:flex;gap:0;border-bottom:1px solid #30363d;margin-bottom:20px">
+    <div class="tab active" id="dt-tab-lic"   onclick="dtSwitch('lic')"  style="padding:8px 16px">Licenses</div>
+    <div class="tab"        id="dt-tab-pay"   onclick="dtSwitch('pay')"  style="padding:8px 16px">Payments</div>
+    <div class="tab"        id="dt-tab-cust"  onclick="dtSwitch('cust')" style="padding:8px 16px">Customers</div>
+  </div>
+
+  <!-- Licenses sub-view -->
+  <div id="dt-lic">
+    <div class="card" style="padding:14px 20px;margin-bottom:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <span id="dt-lic-info" style="font-size:13px;color:#8b949e;flex:1">Click Load to fetch data</span>
+      <button class="btn btn-secondary" onclick="dtLoad('lic',-1)" id="dt-lic-prev" disabled>◀ Prev</button>
+      <button class="btn btn-secondary" onclick="dtLoad('lic', 1)" id="dt-lic-next" disabled>Next ▶</button>
+      <button class="btn btn-primary"   onclick="dtLoad('lic', 0)">Load / Refresh</button>
+    </div>
+    <div class="card" style="padding:0;overflow-x:auto">
+      <table><thead><tr>
+        <th>Activated</th><th>Identity</th><th>Ch</th><th>Product</th>
+        <th>Plan</th><th>Status</th><th>Source</th><th>Amount</th>
+        <th>Verifies</th><th>Last seen</th><th>Machine</th>
+      </tr></thead><tbody id="dt-lic-body">
+        <tr><td colspan="11" style="color:#8b949e;text-align:center;padding:32px">Click Load to fetch licenses</td></tr>
+      </tbody></table>
+    </div>
+  </div>
+
+  <!-- Payments sub-view -->
+  <div id="dt-pay" style="display:none">
+    <div class="card" style="padding:14px 20px;margin-bottom:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <span id="dt-pay-info" style="font-size:13px;color:#8b949e;flex:1">Click Load to fetch data</span>
+      <button class="btn btn-secondary" onclick="dtLoad('pay',-1)" id="dt-pay-prev" disabled>◀ Prev</button>
+      <button class="btn btn-secondary" onclick="dtLoad('pay', 1)" id="dt-pay-next" disabled>Next ▶</button>
+      <button class="btn btn-primary"   onclick="dtLoad('pay', 0)">Load / Refresh</button>
+    </div>
+    <div class="card" style="padding:0;overflow-x:auto">
+      <table><thead><tr>
+        <th>Paid at</th><th>Identity</th><th>Ch</th><th>Product</th>
+        <th>Source</th><th>Amount</th><th>Plan</th><th>Status</th><th>Payment ref</th>
+      </tr></thead><tbody id="dt-pay-body">
+        <tr><td colspan="9" style="color:#8b949e;text-align:center;padding:32px">Click Load to fetch payments</td></tr>
+      </tbody></table>
+    </div>
+  </div>
+
+  <!-- Customers sub-view -->
+  <div id="dt-cust" style="display:none">
+    <div class="card" style="padding:14px 20px;margin-bottom:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <span id="dt-cust-info" style="font-size:13px;color:#8b949e;flex:1">Click Load to fetch data</span>
+      <button class="btn btn-secondary" onclick="dtLoad('cust',-1)" id="dt-cust-prev" disabled>◀ Prev</button>
+      <button class="btn btn-secondary" onclick="dtLoad('cust', 1)" id="dt-cust-next" disabled>Next ▶</button>
+      <button class="btn btn-primary"   onclick="dtLoad('cust', 0)">Load / Refresh</button>
+    </div>
+    <div class="card" style="padding:0;overflow-x:auto">
+      <table><thead><tr>
+        <th>Joined</th><th>Identity</th><th>Ch</th>
+        <th>Active licenses</th><th>Total licenses</th>
+      </tr></thead><tbody id="dt-cust-body">
+        <tr><td colspan="5" style="color:#8b949e;text-align:center;padding:32px">Click Load to fetch customers</td></tr>
+      </tbody></table>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -412,6 +480,135 @@ async function lookupCustomer() {
         <td><span class="badge ${l.is_active&&!l.is_expired?'badge-green':'badge-red'}">${l.is_active&&!l.is_expired?'Active':l.is_expired?'Expired':'Revoked'}</span></td>
       </tr>`).join('')}</tbody></table>
     </div>`;
+}
+
+
+// ── Data browser ──────────────────────────────────────────────────────────────
+const DT_PAGE = 500;
+const dtState = {
+  lic:  {offset:0, total:0, loaded:false},
+  pay:  {offset:0, total:0, loaded:false},
+  cust: {offset:0, total:0, loaded:false},
+};
+const dtEndpoint = {lic:'licenses', pay:'payments', cust:'customers'};
+
+function dtSwitch(view) {
+  ['lic','pay','cust'].forEach(v => {
+    document.getElementById('dt-'+v).style.display = v===view ? '' : 'none';
+    document.getElementById('dt-tab-'+v).classList.toggle('active', v===view);
+  });
+  // Auto-load first time tab is visited
+  if (!dtState[view].loaded) dtLoad(view, 0);
+}
+
+async function dtLoad(view, dir) {
+  const st = dtState[view];
+  // dir: 0=reset/reload, 1=next, -1=prev
+  if (dir === 0) { st.offset = 0; }
+  else if (dir === 1) { st.offset = Math.min(st.offset + DT_PAGE, Math.max(0, st.total - DT_PAGE)); }
+  else if (dir === -1) { st.offset = Math.max(0, st.offset - DT_PAGE); }
+
+  const infoEl  = document.getElementById('dt-'+view+'-info');
+  const prevBtn = document.getElementById('dt-'+view+'-prev');
+  const nextBtn = document.getElementById('dt-'+view+'-next');
+  const tbody   = document.getElementById('dt-'+view+'-body');
+
+  infoEl.textContent = 'Loading…';
+  prevBtn.disabled = true;
+  nextBtn.disabled = true;
+
+  try {
+    const r = await apiCall('/admin/browse/'+dtEndpoint[view], {
+      offset: st.offset, limit: DT_PAGE
+    });
+    if (!r.ok) {
+      infoEl.textContent = '✗ ' + (r.reason || 'Error');
+      return;
+    }
+    st.total  = r.total;
+    st.loaded = true;
+    const from = st.offset + 1;
+    const to   = Math.min(st.offset + r.rows.length, r.total);
+    infoEl.textContent = r.total === 0
+      ? 'No records found'
+      : `Showing ${from}–${to} of ${r.total} (latest first)`;
+    prevBtn.disabled = st.offset <= 0;
+    nextBtn.disabled = !r.has_more;
+
+    if (view === 'lic')  tbody.innerHTML = dtRenderLic(r.rows);
+    if (view === 'pay')  tbody.innerHTML = dtRenderPay(r.rows);
+    if (view === 'cust') tbody.innerHTML = dtRenderCust(r.rows);
+  } catch(e) {
+    infoEl.textContent = '✗ ' + e.message;
+  }
+}
+
+function chBadge(t) {
+  return t==='email' ? '<span style="color:#58a6ff;font-size:11px">✉</span>'
+                     : '<span style="color:#3fb950;font-size:11px">📱</span>';
+}
+
+function dtRenderLic(rows) {
+  if (!rows.length) return '<tr><td colspan="11" style="color:#8b949e;text-align:center;padding:24px">No licenses</td></tr>';
+  return rows.map(r => {
+    const status = !r.is_active ? '<span class="badge badge-red">Revoked</span>'
+                 : r.expires_at && Date.now()/1000 > r.expires_at
+                   ? '<span class="badge badge-amber">Expired</span>'
+                   : '<span class="badge badge-green">Active</span>';
+    const amt = r.currency==='INR' ? '₹'+(r.amount||0) : '$'+(r.amount||0);
+    const machine = r.machine_label || (r.machine_id ? r.machine_id.slice(0,12)+'…' : '—');
+    return `<tr>
+      <td style="white-space:nowrap">${fmt_ts(r.activated_at)}</td>
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${r.identity}">${r.identity}</td>
+      <td>${chBadge(r.identity_type)}</td>
+      <td><code>${r.product_id}</code></td>
+      <td><span class="badge badge-blue">${r.plan}</span></td>
+      <td>${status}</td>
+      <td style="font-size:11px;color:#8b949e">${r.source||'—'}</td>
+      <td style="white-space:nowrap">${amt} ${r.currency||''}</td>
+      <td style="text-align:center">${r.verify_count||0}</td>
+      <td style="white-space:nowrap;color:#8b949e;font-size:12px">${fmt_ts(r.last_seen_at)}</td>
+      <td style="font-size:11px;color:#8b949e;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${r.machine_label||r.machine_id||''}">${machine}</td>
+    </tr>`;
+  }).join('');
+}
+
+function dtRenderPay(rows) {
+  if (!rows.length) return '<tr><td colspan="9" style="color:#8b949e;text-align:center;padding:24px">No payments</td></tr>';
+  return rows.map(r => {
+    const status = r.is_refunded
+      ? '<span class="badge badge-red">Refunded</span>'
+      : '<span class="badge badge-green">Paid</span>';
+    const amt = r.currency==='INR' ? '₹'+r.amount : '$'+r.amount;
+    return `<tr>
+      <td style="white-space:nowrap">${fmt_ts(r.paid_at)}</td>
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${r.identity}">${r.identity}</td>
+      <td>${chBadge(r.identity_type)}</td>
+      <td><code>${r.product_id}</code></td>
+      <td style="font-size:11px;color:#8b949e">${r.source}</td>
+      <td style="white-space:nowrap">${amt}</td>
+      <td><span class="badge badge-blue">${r.plan}</span></td>
+      <td>${status}</td>
+      <td style="font-size:11px;color:#8b949e;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${r.payment_ref}">${r.payment_ref}</td>
+    </tr>`;
+  }).join('');
+}
+
+function dtRenderCust(rows) {
+  if (!rows.length) return '<tr><td colspan="5" style="color:#8b949e;text-align:center;padding:24px">No customers</td></tr>';
+  return rows.map(r => {
+    const active = r.active_licenses || 0;
+    const total  = r.total_licenses  || 0;
+    return `<tr>
+      <td style="white-space:nowrap">${fmt_ts(r.created_at)}</td>
+      <td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${r.identity}">${r.identity}</td>
+      <td>${chBadge(r.identity_type)}</td>
+      <td style="text-align:center">
+        <span class="badge ${active>0?'badge-green':'badge-red'}">${active}</span>
+      </td>
+      <td style="text-align:center;color:#8b949e">${total}</td>
+    </tr>`;
+  }).join('');
 }
 
 // Health check (unencrypted)
