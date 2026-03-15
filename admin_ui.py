@@ -73,14 +73,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     padding:36px 40px;width:100%;max-width:420px;margin:auto}
   .login-box h2{color:#58a6ff;font-size:20px;font-weight:600;margin-bottom:8px}
   .login-box p.sub{color:#8b949e;font-size:13px;margin-bottom:28px}
-  .login-box input{width:100%;background:#1c2128;border:2px solid #58a6ff;color:#e6edf3;
-    padding:10px 14px;border-radius:6px;font-size:14px;margin-bottom:16px;display:block}
-  .login-box input::placeholder{color:#8b949e}
-  .login-box input:focus{outline:none;border-color:#58a6ff}
-  .login-box button{width:100%;padding:12px;border-radius:6px;border:none;
-    background:#238636;color:#fff;font-size:15px;font-weight:600;cursor:pointer;margin-top:8px}
   .login-box button:hover:not(:disabled){background:#2ea043}
-  .login-box button:disabled{background:#21262d;color:#8b949e;cursor:default}
+  .login-box button:disabled{background:#21262d !important;color:#8b949e !important;cursor:default !important}
   #login-err{color:#f85149;font-size:13px;margin-bottom:12px;min-height:20px;font-weight:500}
   #login-step2{display:none}
   .session-bar{font-size:12px;color:#8b949e;margin-left:auto;cursor:pointer}
@@ -99,22 +93,35 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <p class="sub">License Server Admin Dashboard</p>
     <div id="login-err"></div>
 
-    <div id="login-step1">
+    <div id="login-step1" style="display:block">
       <input type="password" id="l-pass" placeholder="Admin token / password"
-             onkeydown="if(event.key==='Enter')loginStep1()"/>
-      <button id="l-btn1" onclick="loginStep1()">Continue →</button>
+             onkeydown="if(event.key==='Enter')loginStep1()"
+             style="display:block;width:100%;background:#1c2128;border:2px solid #58a6ff;
+                    color:#e6edf3;padding:10px 14px;border-radius:6px;font-size:14px;
+                    margin-bottom:16px;box-sizing:border-box;outline:none"/>
+      <button id="l-btn1" onclick="loginStep1()"
+              style="display:block;width:100%;padding:12px;border-radius:6px;border:none;
+                     background:#238636;color:#fff;font-size:15px;font-weight:600;
+                     cursor:pointer;box-sizing:border-box">Continue &#8594;</button>
     </div>
 
-    <div id="login-step2">
+    <div id="login-step2" style="display:none">
       <p id="l-otp-hint" style="color:#8b949e;font-size:13px;margin-bottom:16px"></p>
       <input type="text" id="l-otp" placeholder="6-digit code"
-             maxlength="6" style="letter-spacing:8px;font-size:20px;text-align:center"
+             maxlength="6"
              oninput="this.value=this.value.replace(/\\D/g,'')"
-             onkeydown="if(event.key==='Enter')loginStep2()"/>
-      <button id="l-btn2" onclick="loginStep2()">Verify &amp; Connect</button>
+             onkeydown="if(event.key==='Enter')loginStep2()"
+             style="display:block;width:100%;background:#1c2128;border:2px solid #58a6ff;
+                    color:#e6edf3;padding:10px 14px;border-radius:6px;font-size:20px;
+                    letter-spacing:8px;text-align:center;margin-bottom:16px;
+                    box-sizing:border-box;outline:none"/>
+      <button id="l-btn2" onclick="loginStep2()"
+              style="display:block;width:100%;padding:12px;border-radius:6px;border:none;
+                     background:#238636;color:#fff;font-size:15px;font-weight:600;
+                     cursor:pointer;box-sizing:border-box">Verify &amp; Connect</button>
       <p style="margin-top:14px;font-size:12px;color:#8b949e;text-align:center">
-        <span style="cursor:pointer;color:#58a6ff" onclick="loginReset()">← Back</span>
-        &nbsp;·&nbsp;
+        <span style="cursor:pointer;color:#58a6ff" onclick="loginReset()">&#8592; Back</span>
+        &nbsp;&#183;&nbsp;
         <span style="cursor:pointer;color:#58a6ff" onclick="loginStep1()">Resend OTP</span>
       </p>
     </div>
@@ -371,7 +378,7 @@ async function pbkdf2Unwrap(password, saltHex, nonceHex, wrappedHex, iterations)
 // ── LOGIN STEP 1 — password + key unwrap + OTP request ───────────────────────
 function loginReset() {
   _sk = null; _tok = ''; _pass = ''; _sessionExpiry = 0;
-  document.getElementById('login-step1').style.display = '';
+  document.getElementById('login-step1').style.display = 'block';
   document.getElementById('login-step2').style.display = 'none';
   document.getElementById('login-err').textContent     = '';
   document.getElementById('l-pass').value = '';
