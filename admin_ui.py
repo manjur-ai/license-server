@@ -86,48 +86,60 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </head>
 <body>
 
-<!-- ── Login overlay ─────────────────────────────────────────────────────── -->
-<div id="login-overlay">
-  <div class="login-box">
-    <h2>⚙ Admin Login</h2>
-    <p class="sub">License Server Admin Dashboard</p>
-    <div id="login-err"></div>
+<!-- Login -->
+<div id="login-overlay" style="position:fixed;top:0;left:0;right:0;bottom:0;
+     background:#0d1117;z-index:1000;display:flex;align-items:center;
+     justify-content:center">
+  <div style="background:#ffffff;border-radius:12px;padding:40px;width:380px;
+              box-shadow:0 4px 32px rgba(0,0,0,0.5)">
+    <h2 style="color:#1d4ed8;font-size:22px;margin:0 0 6px 0;font-family:Arial,sans-serif">
+      &#9881; Admin Login</h2>
+    <p style="color:#6b7280;font-size:14px;margin:0 0 24px 0;font-family:Arial,sans-serif">
+      License Server Admin Dashboard</p>
+    <div id="login-err" style="color:#dc2626;font-size:13px;margin-bottom:12px;
+         font-family:Arial,sans-serif;min-height:18px;font-weight:600"></div>
 
-    <div id="login-step1" style="display:block">
-      <input type="password" id="l-pass" placeholder="Admin token / password"
+    <div id="login-step1">
+      <input type="password" id="l-pass"
+             placeholder="Admin token / password"
              onkeydown="if(event.key==='Enter')loginStep1()"
-             style="display:block;width:100%;background:#1c2128;border:2px solid #58a6ff;
-                    color:#e6edf3;padding:10px 14px;border-radius:6px;font-size:14px;
-                    margin-bottom:16px;box-sizing:border-box;outline:none"/>
+             style="display:block;width:100%;padding:12px 14px;border:2px solid #d1d5db;
+                    border-radius:8px;font-size:15px;color:#111827;background:#f9fafb;
+                    box-sizing:border-box;margin-bottom:14px;outline:none;
+                    font-family:Arial,sans-serif" />
       <button id="l-btn1" onclick="loginStep1()"
-              style="display:block;width:100%;padding:12px;border-radius:6px;border:none;
-                     background:#238636;color:#fff;font-size:15px;font-weight:600;
-                     cursor:pointer;box-sizing:border-box">Continue &#8594;</button>
+              style="display:block;width:100%;padding:13px;border:none;border-radius:8px;
+                     background:#16a34a;color:#ffffff;font-size:15px;font-weight:700;
+                     cursor:pointer;font-family:Arial,sans-serif;box-sizing:border-box">
+        Continue &#8594;</button>
     </div>
 
     <div id="login-step2" style="display:none">
-      <p id="l-otp-hint" style="color:#8b949e;font-size:13px;margin-bottom:16px"></p>
-      <input type="text" id="l-otp" placeholder="6-digit code"
+      <p id="l-otp-hint" style="color:#374151;font-size:13px;margin:0 0 14px 0;
+         font-family:Arial,sans-serif"></p>
+      <input type="text" id="l-otp"
+             placeholder="6-digit code"
              maxlength="6"
-             oninput="this.value=this.value.replace(/\\D/g,'')"
+             oninput="this.value=this.value.replace(/\D/g,'')"
              onkeydown="if(event.key==='Enter')loginStep2()"
-             style="display:block;width:100%;background:#1c2128;border:2px solid #58a6ff;
-                    color:#e6edf3;padding:10px 14px;border-radius:6px;font-size:20px;
-                    letter-spacing:8px;text-align:center;margin-bottom:16px;
-                    box-sizing:border-box;outline:none"/>
+             style="display:block;width:100%;padding:12px 14px;border:2px solid #d1d5db;
+                    border-radius:8px;font-size:24px;letter-spacing:12px;text-align:center;
+                    color:#111827;background:#f9fafb;box-sizing:border-box;
+                    margin-bottom:14px;outline:none;font-family:Arial,sans-serif" />
       <button id="l-btn2" onclick="loginStep2()"
-              style="display:block;width:100%;padding:12px;border-radius:6px;border:none;
-                     background:#238636;color:#fff;font-size:15px;font-weight:600;
-                     cursor:pointer;box-sizing:border-box">Verify &amp; Connect</button>
-      <p style="margin-top:14px;font-size:12px;color:#8b949e;text-align:center">
-        <span style="cursor:pointer;color:#58a6ff" onclick="loginReset()">&#8592; Back</span>
-        &nbsp;&#183;&nbsp;
-        <span style="cursor:pointer;color:#58a6ff" onclick="loginStep1()">Resend OTP</span>
+              style="display:block;width:100%;padding:13px;border:none;border-radius:8px;
+                     background:#16a34a;color:#ffffff;font-size:15px;font-weight:700;
+                     cursor:pointer;font-family:Arial,sans-serif;box-sizing:border-box">
+        Verify &amp; Connect</button>
+      <p style="margin-top:14px;font-size:13px;color:#6b7280;text-align:center;
+         font-family:Arial,sans-serif">
+        <span style="cursor:pointer;color:#1d4ed8" onclick="loginReset()">&#8592; Back</span>
+        &nbsp;&nbsp;&#183;&nbsp;&nbsp;
+        <span style="cursor:pointer;color:#1d4ed8" onclick="loginStep1()">Resend OTP</span>
       </p>
     </div>
   </div>
 </div>
-
 <div id="loading">Loading…</div>
 
 <div class="topbar">
@@ -388,9 +400,11 @@ function loginReset() {
 
 function btnState(id, busy) {
   const b = document.getElementById(id);
-  b.disabled    = busy;
+  b.disabled = busy;
+  b.style.background = busy ? '#9ca3af' : '#16a34a';
+  b.style.cursor     = busy ? 'default'  : 'pointer';
   b.textContent = busy
-    ? (id==='l-btn1' ? 'Sending OTP…' : 'Verifying…')
+    ? (id==='l-btn1' ? 'Sending OTP...' : 'Verifying...')
     : (id==='l-btn1' ? 'Continue →' : 'Verify & Connect');
 }
 
