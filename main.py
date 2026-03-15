@@ -1190,7 +1190,7 @@ async def admin_browse_customers(payload: Payload):
 #  ADMIN AUTH — OTP LOGIN  (two-step: request OTP → verify OTP → session token)
 # ═════════════════════════════════════════════════════════════════════════════
 
-@app.post("/admin/request-otp")
+@app.post("/auth/admin/request-otp")
 async def admin_request_otp(payload: Payload):
     """
     Step 1 of admin login. Verifies ADMIN_TOKEN then sends OTP to ADMIN_EMAILS.
@@ -1257,7 +1257,7 @@ async def admin_request_otp(payload: Payload):
     })})
 
 
-@app.post("/admin/verify-otp")
+@app.post("/auth/admin/verify-otp")
 async def admin_verify_otp(payload: Payload):
     """
     Step 2 of admin login. Verifies the OTP and returns a session token.
@@ -1295,7 +1295,7 @@ async def admin_verify_otp(payload: Payload):
     })})
 
 
-@app.get("/admin/wrapped-secret")
+@app.get("/auth/admin/wrapped-secret")
 async def admin_wrapped_secret():
     """
     Returns the SHARED_SECRET wrapped (AES-256-GCM encrypted) with a key derived
