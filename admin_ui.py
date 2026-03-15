@@ -67,9 +67,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .msg-ok{background:#033a16;color:#3fb950;border:1px solid #1a5c2a}
   .msg-err{background:#3d1212;color:#f85149;border:1px solid #8b1a1a}
   #login-overlay{position:fixed;inset:0;background:#0d1117;z-index:1000;
-    display:flex;align-items:center;justify-content:center}
+    display:flex;align-items:flex-start;justify-content:center;
+    overflow-y:auto;padding:40px 16px}
   .login-box{background:#161b22;border:1px solid #30363d;border-radius:12px;
-    padding:40px;width:100%;max-width:400px}
+    padding:36px 40px;width:100%;max-width:420px;margin:auto}
   .login-box h2{color:#58a6ff;font-size:20px;font-weight:600;margin-bottom:8px}
   .login-box p.sub{color:#8b949e;font-size:13px;margin-bottom:28px}
   .login-box input{width:100%;background:#0d1117;border:1px solid #30363d;color:#e6edf3;
@@ -382,7 +383,7 @@ function btnState(id, busy) {
   b.disabled    = busy;
   b.textContent = busy
     ? (id==='l-btn1' ? 'Sending OTP…' : 'Verifying…')
-    : (id==='l-btn1' ? 'Continue \u2192'   : 'Verify & Connect');
+    : (id==='l-btn1' ? 'Continue →' : 'Verify & Connect');
 }
 
 async function loginStep1() {
