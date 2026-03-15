@@ -393,7 +393,7 @@ async function loginStep1() {
   btnState('l-btn1', true);
   try {
     // 1. Fetch wrapped secret (unauthenticated — safe, useless without password)
-    const wr = await fetch(base + '/admin/wrapped-secret').then(r => {
+    const wr = await fetch(base + '/auth/admin/wrapped-secret').then(r => {
       if (!r.ok) throw new Error('Server unreachable (HTTP ' + r.status + ')');
       return r.json();
     });
@@ -406,7 +406,7 @@ async function loginStep1() {
     }
 
     // 3. Request OTP (encrypted with just-unwrapped key)
-    const otpR = await apiCall('/admin/request-otp', {admin_token: _pass});
+    const otpR = await apiCall('/auth/admin/request-otp', {admin_token: _pass});
     if (!otpR.ok) {
       _sk = null; _pass = '';
       throw new Error(
@@ -439,7 +439,7 @@ async function loginStep2() {
   document.getElementById('login-err').textContent = '';
   btnState('l-btn2', true);
   try {
-    const r = await apiCall('/admin/verify-otp', {admin_token: _pass, otp});
+    const r = await apiCall('/auth/admin/verify-otp', {admin_token: _pass, otp});
     if (!r.ok) {
       throw new Error(
         r.reason === 'invalid_otp'           ? 'Wrong code — check the email and try again'
