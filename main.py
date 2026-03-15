@@ -1,1357 +1,776 @@
 """
-main.py — License Server
-Full flow:
-  Step 1. POST /send-otp    → generates OTP, sends to email OR phone
-  Step 2. POST /verify-otp  → user submits OTP → identity marked verified
-  Step 3. POST /register    → payment verified + identity verified → license created
-  Step 4. POST /verify      → silent check on every EXE launch (no OTP needed)
+admin_ui.py  —  Single-file HTML admin dashboard
+Mount into main.py with:  app.mount("/admin", admin_app)
+Access: GET /admin/ui
 
-identity_type values:
-  "email"  → identity is an email address  e.g. "user@gmail.com"
-  "sms"    → identity is a phone number    e.g. "+919876543210"
-  "google" → identity is "google:<uid>"    (future — no OTP, uses Google token)
-
-Environment variables (set on Railway):
-  SHARED_SECRET         32-byte hex — must match C++ client
-  ADMIN_TOKEN           your admin password
-  RAZORPAY_KEY_ID       rzp_live_xxxx
-  RAZORPAY_KEY_SECRET   razorpay secret
-  SUPPORT_EMAIL         email shown in email footers
-  TEST_MODE             true (local testing only — NEVER set on Railway prod)
-  EMAIL_SEND_METHODS    JSON array — see email_sender.py
-  SMS_SEND_METHODS      JSON array — see sms_sender.py
+Security model:
+  - SHARED_SECRET never appears in HTML source, cookies, or any browser storage.
+  - Login is two-factor: ADMIN_TOKEN password + OTP sent to ADMIN_EMAILS.
+  - On login, browser calls GET /admin/wrapped-secret which returns
+    SHARED_SECRET wrapped with AES-GCM using a key derived via
+    PBKDF2-SHA256(ADMIN_TOKEN, random_salt, 100k iterations).
+  - Browser unwraps client-side with WebCrypto — secret held only in JS memory.
+  - All API calls use the unwrapped key for AES-GCM encryption.
+  - Session token expires in 30 minutes. Page shows countdown.
+  - Add ADMIN_EMAILS env var (comma-separated). Falls back to SUPPORT_EMAIL.
 """
-
-from fastapi import FastAPI, Request, Depends, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel
-import os, time, json, base64, secrets, hashlib, hmac
-import requests as http_requests
-from email_sender import send_email as _send_email, EMAIL_SEND_METHODS
-from sms_sender   import send_sms_otp, SMS_SEND_METHODS
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from database import (
-    init_db, get_product, normalize_identity,
-    generate_otp, store_otp, is_valid_otp, is_identity_verified,
-    register_license, verify_license,
-    revoke_license, mark_refunded, backup_db,
-    list_machines, unlink_machines,
-    check_otp_rate, upsert_product, list_products, delete_product,
-    create_coupon, validate_coupon, redeem_coupon, list_coupons,
-    get_customer_profile, get_stats, VALID_PLANS,
-)
-
-from admin_ui import admin_app
-app = FastAPI()
-app.mount("/admin", admin_app)
-
-# ── DB startup ────────────────────────────────────────────────────────────────
-_DB_INIT_ERROR: str = ""
-try:
-    init_db()
-except Exception as _e:
-    _DB_INIT_ERROR = str(_e)
-    print(f"FATAL: database init failed — {_DB_INIT_ERROR}")
-
-# ── Config ────────────────────────────────────────────────────────────────────
-SHARED_SECRET       = bytes.fromhex(os.environ.get("SHARED_SECRET",
-    "8cfaf7568ebd0d6f5557552efa46e43dfa57bb9618635753c224d3f38b3ac158"))
-ADMIN_TOKEN         = os.environ.get("ADMIN_TOKEN",         "change_this")
-RAZORPAY_KEY_ID     = os.environ.get("RAZORPAY_KEY_ID",     "")
-RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
-SUPPORT_EMAIL       = os.environ.get("SUPPORT_EMAIL",       "support@toolfy.com")
-TEST_MODE           = os.environ.get("TEST_MODE", "false").lower() == "true"
-MAX_TS_DRIFT        = 30
-
-# ── Admin auth: email(s) that receive the login OTP ──────────────────────────
-# Set ADMIN_EMAILS as comma-separated list: "alice@gmail.com,bob@gmail.com"
-# Falls back to SUPPORT_EMAIL if not set.
-ADMIN_EMAILS: list = [
-    e.strip() for e in
-    os.environ.get("ADMIN_EMAILS", os.environ.get("SUPPORT_EMAIL", "")).split(",")
-    if e.strip()
-]
-
-# ── Admin session tokens: stateless HMAC, 30-minute validity ─────────────────
-ADMIN_SESSION_MINUTES = 30
-
-def _make_session_token(issued_at: int) -> str:
-    """Create a session token: HMAC-SHA256(secret, 'admin-session:' + issued_at)."""
-    msg = f"admin-session:{issued_at}".encode()
-    return hmac.new(SHARED_SECRET, msg, hashlib.sha256).hexdigest() + f":{issued_at}"
-
-def _verify_session_token(token: str) -> bool:
-    """Verify a session token and check it is within ADMIN_SESSION_MINUTES."""
-    try:
-        sig, issued_str = token.rsplit(":", 1)
-        issued_at = int(issued_str)
-        if abs(time.time() - issued_at) > ADMIN_SESSION_MINUTES * 60:
-            return False
-        expected = hmac.new(SHARED_SECRET,
-                            f"admin-session:{issued_at}".encode(),
-                            hashlib.sha256).hexdigest()
-        return hmac.compare_digest(sig, expected)
-    except Exception:
-        return False
-
-# Temporary OTP store for admin login (in-memory, keyed by HMAC of admin_token)
-import threading as _threading
-_admin_otp_store: dict = {}
-_admin_otp_lock  = _threading.Lock()
-
-def _store_admin_otp(otp: str):
-    with _admin_otp_lock:
-        _admin_otp_store["otp"]        = otp
-        _admin_otp_store["issued_at"]  = time.time()
-        _admin_otp_store["attempts"]   = 0
-
-def _verify_admin_otp(otp: str) -> str:
-    """Returns 'ok', 'expired', 'invalid', or 'max_attempts'."""
-    with _admin_otp_lock:
-        entry = _admin_otp_store.copy()
-    if not entry:
-        return "not_requested"
-    if time.time() - entry.get("issued_at", 0) > 600:   # 10 min expiry
-        return "expired"
-    if entry.get("attempts", 0) >= 5:
-        return "max_attempts"
-    with _admin_otp_lock:
-        _admin_otp_store["attempts"] = entry["attempts"] + 1
-    if hmac.compare_digest(otp.strip(), entry.get("otp", "")):
-        with _admin_otp_lock:
-            _admin_otp_store.clear()   # one-time use
-        return "ok"
-    return "invalid"
-
-# ── Crypto ────────────────────────────────────────────────────────────────────
-
-def aes_decrypt(b64: str) -> dict:
-    try:
-        raw = base64.b64decode(b64)
-        pt  = AESGCM(SHARED_SECRET).decrypt(raw[:12], raw[12:], None)
-        return json.loads(pt)
-    except:
-        return {}
-
-def aes_encrypt(data: dict) -> str:
-    nonce = secrets.token_bytes(12)
-    ct    = AESGCM(SHARED_SECRET).encrypt(nonce, json.dumps(data).encode(), None)
-    return base64.b64encode(nonce + ct).decode()
-
-def valid_ts(ts) -> bool:
-    try:    return abs(time.time() - float(ts)) <= MAX_TS_DRIFT
-    except: return False
-
-def make_unique_key(product_id: str, identity: str, identity_type: str, machine_id: str) -> str:
-    identity = normalize_identity(identity, identity_type)
-    data = f"{product_id}:{identity_type}:{identity}:{machine_id}".encode()
-    return hmac.new(SHARED_SECRET, data, hashlib.sha256).hexdigest()
-
-# ── Notification dispatch ─────────────────────────────────────────────────────
-# Routes to email or SMS based on identity_type
-
-def send_email(to: str, subject: str, html_body: str) -> dict:
-    """Returns SendResult dict: {ok, reason, provider}"""
-    ok = _send_email(to, subject, html_body, test_mode=TEST_MODE)
-    return {
-        "ok":       ok,
-        "reason":   "sent" if ok else ("not_configured" if not EMAIL_SEND_METHODS else "all_methods_failed"),
-        "provider": "email",
-    }
-
-def notify_otp(identity: str, identity_type: str, otp: str, product_name: str) -> dict:
-    """
-    Send OTP via email or SMS depending on identity_type.
-    Returns a SendResult dict: {ok, reason, provider}
-
-    Possible reasons:
-      "sent"               — OTP delivered successfully
-      "not_configured"     — email/SMS provider not set up in env vars
-      "all_methods_failed" — every configured provider failed to deliver
-    """
-    if identity_type == "sms":
-        ok = send_sms_otp(identity, otp, test_mode=TEST_MODE)
-        return {
-            "ok":       ok,
-            "reason":   "sent" if ok else "all_methods_failed",
-            "provider": "sms",
-        }
-    else:
-        return send_email(
-            to        = identity,
-            subject   = f"Your verification code: {otp}",
-            html_body = f"""
-            <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px">
-                <h2 style="color:#1d4ed8">Verification Code</h2>
-                <p>You requested to activate <b>{product_name}</b>.</p>
-                <p>Enter this code in the application:</p>
-                <div style="font-size:40px;font-weight:bold;letter-spacing:10px;
-                            color:#1d4ed8;background:#eff6ff;padding:24px;
-                            border-radius:10px;text-align:center;margin:16px 0">
-                    {otp}
-                </div>
-                <p style="color:#6b7280;font-size:13px">
-                    This code expires in <b>10 minutes</b>.<br>
-                    If you didn't request this, ignore this message.<br><br>
-                    Support: <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>
-                </p>
-            </div>
-            """
-        )
-
-def notify_activated(identity: str, identity_type: str, product_name: str, plan: str):
-    """Send activation confirmation — email only (SMS too long)."""
-    if identity_type != "email":
-        return   # Skip SMS for activation — too long for SMS
-    send_email(
-        to        = identity,
-        subject   = f"✅ Your {product_name} license is activated",
-        html_body = f"""
-        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px">
-            <h2 style="color:#16a34a">License Activated!</h2>
-            <p>Your <b>{product_name}</b> license is now active.</p>
-            <table style="border-collapse:collapse;width:100%;margin:16px 0">
-                <tr style="background:#f0fdf4">
-                    <td style="padding:10px;border:1px solid #bbf7d0"><b>Product</b></td>
-                    <td style="padding:10px;border:1px solid #bbf7d0">{product_name}</td>
-                </tr>
-                <tr>
-                    <td style="padding:10px;border:1px solid #e5e7eb"><b>Plan</b></td>
-                    <td style="padding:10px;border:1px solid #e5e7eb">{plan.title()}</td>
-                </tr>
-                <tr style="background:#f9fafb">
-                    <td style="padding:10px;border:1px solid #e5e7eb"><b>Note</b></td>
-                    <td style="padding:10px;border:1px solid #e5e7eb">
-                        This license is tied to your current machine.
-                    </td>
-                </tr>
-            </table>
-            <p style="color:#6b7280;font-size:13px">
-                Changing your PC? Contact us to transfer.<br>
-                Support: <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>
-            </p>
-        </div>
-        """
-    )
-
-def notify_revoked(identity: str, identity_type: str, product_name: str, reason: str):
-    if identity_type != "email":
-        return
-    reason_map = {
-        "refund": "your payment was refunded",
-        "abuse":  "a violation of our terms was detected",
-        "manual": "an administrative action was taken",
-    }
-    send_email(
-        to        = identity,
-        subject   = f"⚠️ Your {product_name} license has been deactivated",
-        html_body = f"""
-        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px">
-            <h2 style="color:#dc2626">License Deactivated</h2>
-            <p>Your <b>{product_name}</b> license was deactivated because
-               {reason_map.get(reason, "an administrative action")}.</p>
-            <p>If this is a mistake, contact us immediately.</p>
-            <p style="color:#6b7280;font-size:13px">
-                Support: <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>
-            </p>
-        </div>
-        """
-    )
-
-def notify_refund(identity: str, identity_type: str, product_name: str):
-    if identity_type != "email":
-        return
-    send_email(
-        to        = identity,
-        subject   = f"💰 Refund processed — {product_name}",
-        html_body = f"""
-        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px">
-            <h2 style="color:#7c3aed">Refund Processed</h2>
-            <p>Your refund for <b>{product_name}</b> has been processed
-               and your license has been deactivated.</p>
-            <p>Amount will appear in your account within 5–7 business days.</p>
-            <p style="color:#6b7280;font-size:13px">
-                Questions? <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>
-            </p>
-        </div>
-        """
-    )
-
-# ── Payment verification ───────────────────────────────────────────────────────
-
-def verify_razorpay_payment(payment_id: str, min_paise: int) -> bool:
-    if not RAZORPAY_KEY_ID: return False
-    try:
-        r = http_requests.get(
-            f"https://api.razorpay.com/v1/payments/{payment_id}",
-            auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET), timeout=10
-        )
-        d = r.json()
-        return d.get("status") == "captured" and d.get("amount", 0) >= min_paise
-    except: return False
-
-def verify_gumroad_key(license_key: str, identity: str, identity_type: str,
-                       gumroad_product_id: str) -> bool:
-    if not gumroad_product_id: return False
-    try:
-        r = http_requests.post(
-            "https://api.gumroad.com/v2/licenses/verify",
-            data={"product_id": gumroad_product_id,
-                  "license_key": license_key.strip(),
-                  "increment_uses_count": "false"}, timeout=10
-        )
-        d = r.json()
-        if not d.get("success"): return False
-        if d.get("purchase", {}).get("refunded"): return False
-        # Email match only when identity_type is email
-        if identity_type == "email":
-            purchase_email = d.get("purchase", {}).get("email", "").lower()
-            if purchase_email and purchase_email != identity.lower(): return False
-        return True
-    except: return False
-
-# ── Request model ──────────────────────────────────────────────────────────────
-
-class Payload(BaseModel):
-    data: str   # AES-GCM encrypted JSON, base64 encoded
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  ENDPOINT 1 — SEND OTP
-# ═════════════════════════════════════════════════════════════════════════════
-
-# ── DB guard: called at the start of every endpoint ──────────────────────────
-def _db_ok():
-    """Returns (True, "") or (False, reason_string) based on DB init status."""
-    if _DB_INIT_ERROR:
-        return False, "database_not_configured"
-    return True, ""
-
-
-@app.post("/send-otp")
-async def send_otp(payload: Payload, request: Request):
-    """
-    Step 1 — EXE calls this first with the user's identity.
-
-    EXE sends (encrypted):
-        {
-          identity:       "user@gmail.com"  OR  "+919876543210",
-          identity_type:  "email" | "sms",
-          product_id:     "TOOL1",
-          timestamp:      1234567890
-        }
-
-    Returns (encrypted):
-        { ok, reason }
-        reason: sent | unknown_product | missing_fields | expired
-        In TEST_MODE also returns: test_otp
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not valid_ts(req.get("timestamp", 0)):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "expired"})})
-
-    identity      = req.get("identity", "").strip()
-    identity_type = req.get("identity_type", "email").lower().strip()
-    product_id    = req.get("product_id", "")
-
-    if not identity or not product_id:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "missing_fields"})})
-
-    if identity_type not in ("email", "sms"):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unsupported_identity_type"})})
-
-    ok_db, db_reason = _db_ok()
-    if not ok_db:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": db_reason})})
-
-    prod = get_product(product_id)
-    if not prod:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unknown_product"})})
-
-    # ── OTP rate limiting ───────────────────────────────────────────
-    ip = request.client.host
-    rate = check_otp_rate(identity, identity_type, ip)
-    if not rate["ok"]:
-        return JSONResponse({"data": aes_encrypt({
-            "ok": False,
-            "reason": rate["reason"],
-            "wait_seconds": rate.get("wait_seconds", 0),
-        })})
-
-    otp = generate_otp()
-    store_otp(identity, identity_type, otp)
-    delivery = notify_otp(identity, identity_type, otp, prod["name"])
-
-    # ── Delivery failed — surface the real reason to the client ──────────
-    if not delivery["ok"]:
-        # Map internal reason → user-facing reason codes
-        reason_map = {
-            "not_configured":     "delivery_not_configured",
-            "all_methods_failed": "delivery_failed",
-        }
-        reason = reason_map.get(delivery["reason"], "delivery_failed")
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": reason})})
-
-    trial_days = prod.get("trial_days", 0)
-    if TEST_MODE:
-        return JSONResponse({"data": aes_encrypt({
-            "ok": True, "reason": "sent",
-            "trial_days": trial_days,
-            "test_otp": otp,
-        })})
-    return JSONResponse({"data": aes_encrypt({
-        "ok": True, "reason": "sent",
-        "trial_days": trial_days,
-    })})
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  ENDPOINT 2 — VERIFY OTP
-# ═════════════════════════════════════════════════════════════════════════════
-
-@app.post("/verify-otp")
-async def verify_otp(payload: Payload, request: Request):
-    """
-    Step 2 — User types the OTP they received.
-
-    EXE sends (encrypted):
-        {
-          identity:       "user@gmail.com"  OR  "+919876543210",
-          identity_type:  "email" | "sms",
-          otp:            "123456",
-          timestamp:      1234567890
-        }
-
-    Returns (encrypted):
-        { ok, reason }
-        reason: verified | already_verified | otp_not_found |
-                otp_expired | invalid_otp | max_attempts_exceeded
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not valid_ts(req.get("timestamp", 0)):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "expired"})})
-
-    identity      = req.get("identity", "").strip()
-    identity_type = req.get("identity_type", "email").lower().strip()
-    otp           = req.get("otp", "").strip()
-
-    if not identity or not otp:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "missing_fields"})})
-
-    result = is_valid_otp(identity, identity_type, otp)
-    return JSONResponse({"data": aes_encrypt(result)})
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  ENDPOINT 3 — REGISTER
-# ═════════════════════════════════════════════════════════════════════════════
-
-@app.post("/register")
-async def register(payload: Payload, request: Request):
-    """
-    Step 3 — Called after OTP verified + payment done.
-
-    EXE sends (encrypted):
-        {
-          product_id:     "TOOL1",
-          identity:       "user@gmail.com"  OR  "+919876543210",
-          identity_type:  "email" | "sms",
-          machine_id:     "sha256hash",
-          timestamp:      1234567890,
-          source:         "razorpay" | "gumroad" | "test",
-
-          -- if source == "razorpay":
-          payment_id:     "pay_xxx"
-
-          -- if source == "gumroad":
-          license_key:    "XXXX-XXXX-XXXX-XXXX"
-        }
-
-    Returns (encrypted):
-        { ok, reason }
-        reason: registered | already_registered | identity_not_verified |
-                payment_invalid | unknown_product | max_machines_reached |
-                payment_already_used
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not valid_ts(req.get("timestamp", 0)):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "expired"})})
-
-    product_id    = req.get("product_id", "")
-    identity      = req.get("identity", "").strip()
-    identity_type = req.get("identity_type", "email").lower().strip()
-    machine_id    = req.get("machine_id", "")
-    source        = req.get("source", "")
-    computer_name = req.get("computer_name", "").strip()
-    os_username   = req.get("os_username",   "").strip()
-    plan          = req.get("plan", "lifetime").strip().lower()
-    coupon_code   = req.get("coupon_code", "").strip()
-    ip            = request.client.host
-
-    if plan not in VALID_PLANS:
-        plan = "lifetime"   # silently normalise unknown plans
-
-    # Build human-readable machine label: "ComputerName / username"
-    parts = [p for p in [computer_name, os_username] if p]
-    machine_label = " / ".join(parts) if parts else None
-
-    if not all([product_id, identity, machine_id, source]):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "missing_fields"})})
-
-    # ── Identity must be OTP-verified ────────────────────────────
-    ok_db, db_reason = _db_ok()
-    if not ok_db:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": db_reason})})
-
-    if not is_identity_verified(identity, identity_type):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "identity_not_verified"})})
-
-    # ── Product check ────────────────────────────────────────────
-    prod = get_product(product_id)
-    if not prod:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unknown_product"})})
-
-    # ── Payment verification ─────────────────────────────────────
-    payment_ref, amount, currency = "", 0.0, "INR"
-
-    # ── Coupon validation (before payment) ──────────────────────────
-    coupon_result = None
-    if coupon_code:
-        coupon_result = validate_coupon(coupon_code, product_id)
-        if not coupon_result["ok"]:
-            return JSONResponse({"data": aes_encrypt({
-                "ok": False, "reason": coupon_result["reason"]})})
-        # Coupon can override plan (e.g. coupon that upgrades trial→lifetime)
-        if coupon_result.get("plan_override"):
-            plan = coupon_result["plan_override"]
-
-    if source == "trial":
-        # Free trial — no payment needed, but product must allow trials
-        trial_days = prod.get("trial_days", 0)
-        if not trial_days:
-            return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "trial_not_available"})})
-        payment_ref      = f"trial_{int(time.time())}"
-        amount, currency = 0.0, "INR"
-        plan             = "trial"
-
-    elif source == "razorpay":
-        payment_ref      = req.get("payment_id", "")
-        amount, currency = prod["price_inr"], "INR"
-        # Apply coupon discount
-        if coupon_result:
-            pct_off = coupon_result.get("discount_pct", 0)
-            flat    = coupon_result.get("discount_inr", 0)
-            amount  = max(0, amount * (1 - pct_off/100) - flat)
-        min_paise = int(amount * 100 * 0.9)  # 10% tolerance
-        if not verify_razorpay_payment(payment_ref, min_paise):
-            return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "payment_invalid"})})
-
-    elif source == "gumroad":
-        payment_ref      = req.get("license_key", "")
-        amount, currency = prod["price_usd"], "USD"
-        if coupon_result:
-            pct_off = coupon_result.get("discount_pct", 0)
-            flat    = coupon_result.get("discount_usd", 0)
-            amount  = max(0, amount * (1 - pct_off/100) - flat)
-        if not verify_gumroad_key(payment_ref, identity, identity_type,
-                                  prod.get("gumroad_product_id", "")):
-            return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "payment_invalid"})})
-
-    elif source == "coupon_only":
-        # 100% discount via coupon — no payment gateway
-        if not coupon_result or coupon_result.get("discount_pct", 0) < 100:
-            return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "payment_invalid"})})
-        payment_ref      = f"coupon_{coupon_code}_{int(time.time())}"
-        amount, currency = 0.0, "INR"
-
-    elif source == "test":
-        if not TEST_MODE:
-            return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "test_mode_disabled"})})
-        payment_ref      = req.get("payment_id", f"test_{int(time.time())}")
-        amount, currency = 0.0, "INR"
-
-    else:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unknown_source"})})
-
-    # ── Register in DB ───────────────────────────────────────────
-    unique_key = make_unique_key(product_id, identity, identity_type, machine_id)
-    result = register_license(
-        product_id, identity, identity_type, machine_id, unique_key,
-        source, payment_ref, amount, currency,
-        plan=plan, ip_address=ip, machine_label=machine_label
-    )
-
-    # ── Post-registration ────────────────────────────────────────
-    if result.get("ok") and result["reason"] == "registered":
-        notify_activated(identity, identity_type, prod["name"], plan)
-        if coupon_code and coupon_result and coupon_result["ok"]:
-            redeem_coupon(coupon_code)
-
-    return JSONResponse({"data": aes_encrypt(result)})
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  ENDPOINT 4 — VERIFY (silent check on every EXE launch)
-# ═════════════════════════════════════════════════════════════════════════════
-
-@app.post("/verify")
-async def verify(payload: Payload, request: Request):
-    """
-    Step 4 — Called silently every time the EXE starts.
-
-    EXE sends (encrypted):
-        {
-          product_id:     "TOOL1",
-          identity:       "user@gmail.com"  OR  "+919876543210",
-          identity_type:  "email" | "sms",
-          machine_id:     "sha256hash",
-          timestamp:      1234567890
-        }
-
-    Returns (encrypted):
-        { ok, reason }
-        reason: ok | not_found | revoked | expired | wrong_product
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not valid_ts(req.get("timestamp", 0)):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "expired"})})
-
-    product_id    = req.get("product_id", "")
-    identity      = req.get("identity", "").strip()
-    identity_type = req.get("identity_type", "email").lower().strip()
-    machine_id    = req.get("machine_id", "")
-    ip            = request.client.host
-
-    if not all([product_id, identity, machine_id]):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "missing_fields"})})
-
-    ok_db, db_reason = _db_ok()
-    if not ok_db:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": db_reason})})
-
-    unique_key = make_unique_key(product_id, identity, identity_type, machine_id)
-    result     = verify_license(product_id, unique_key, ip)
-    return JSONResponse({"data": aes_encrypt(result)})
-
-
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  ENDPOINT 5 — LIST MACHINES
-#  Returns all active machines for this identity+product.
-#  Requires identity to be OTP-verified in this session.
-# ═════════════════════════════════════════════════════════════════════════════
-
-@app.post("/list-machines")
-async def ep_list_machines(payload: Payload, request: Request):
-    """
-    Called when max_machines_reached is returned by /register.
-    Client shows the list so the user can choose which machine to unlink.
-
-    EXE sends (encrypted):
-        {
-          product_id:     "TOOL1",
-          identity:       "user@gmail.com",
-          identity_type:  "email",
-          timestamp:      1234567890
-        }
-
-    Returns (encrypted):
-        {
-          ok:       true,
-          machines: [
-            {
-              unique_key:    "abc123...",
-              machine_label: "DESKTOP-ABC / john",
-              activated_at:  1700000000.0,
-              last_seen_at:  1700100000.0
-            },
-            ...
-          ]
-        }
-
-    Failure reasons:
-        expired | missing_fields | identity_not_verified | database_not_configured
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not valid_ts(req.get("timestamp", 0)):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "expired"})})
-
-    identity      = req.get("identity",      "").strip()
-    identity_type = req.get("identity_type", "email").lower().strip()
-    product_id    = req.get("product_id",    "")
-
-    if not all([identity, product_id]):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "missing_fields"})})
-
-    ok_db, db_reason = _db_ok()
-    if not ok_db:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": db_reason})})
-
-    # Must have completed OTP verification before listing machines
-    if not is_identity_verified(identity, identity_type):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "identity_not_verified"})})
-
-    machines = list_machines(identity, identity_type, product_id)
-    return JSONResponse({"data": aes_encrypt({"ok": True, "machines": machines})})
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  ENDPOINT 6 — UNLINK MACHINES
-#  Deactivates selected machines. After this, client retries /register.
-# ═════════════════════════════════════════════════════════════════════════════
-
-@app.post("/unlink")
-async def ep_unlink(payload: Payload, request: Request):
-    """
-    User selects machines to unlink from the list returned by /list-machines.
-    After successful unlink, the EXE retries /register for the current machine.
-
-    EXE sends (encrypted):
-        {
-          product_id:     "TOOL1",
-          identity:       "user@gmail.com",
-          identity_type:  "email",
-          unique_keys:    ["abc123...", "def456..."],   ← machines to remove
-          timestamp:      1234567890
-        }
-
-    Returns (encrypted):
-        {
-          ok:        true,
-          unlinked:  1,     ← number of machines successfully unlinked
-          not_found: 0      ← keys that didn't match (already gone, or not owned)
-        }
-
-    Failure reasons:
-        expired | missing_fields | identity_not_verified |
-        no_keys_provided | no_owned_keys_found | database_not_configured
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not valid_ts(req.get("timestamp", 0)):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "expired"})})
-
-    identity      = req.get("identity",      "").strip()
-    identity_type = req.get("identity_type", "email").lower().strip()
-    product_id    = req.get("product_id",    "")
-    unique_keys   = req.get("unique_keys",   [])
-
-    if not all([identity, product_id]) or not isinstance(unique_keys, list):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "missing_fields"})})
-
-    if not unique_keys:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "no_keys_provided"})})
-
-    # Hard cap: can't unlink more than 10 at once (sanity guard)
-    unique_keys = unique_keys[:10]
-
-    ok_db, db_reason = _db_ok()
-    if not ok_db:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": db_reason})})
-
-    # Must have completed OTP verification before unlinking
-    if not is_identity_verified(identity, identity_type):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "identity_not_verified"})})
-
-    result = unlink_machines(identity, identity_type, product_id, unique_keys)
-    return JSONResponse({"data": aes_encrypt(result)})
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  ENDPOINT — VALIDATE COUPON  (call before payment to show discount)
-# ═════════════════════════════════════════════════════════════════════════════
-
-@app.post("/validate-coupon")
-async def ep_validate_coupon(payload: Payload):
-    """
-    EXE sends: { product_id, coupon_code, timestamp }
-    Returns:   { ok, discount_pct, discount_inr, discount_usd,
-                 plan_override, reason }
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not valid_ts(req.get("timestamp", 0)):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "expired"})})
-    ok_db, db_reason = _db_ok()
-    if not ok_db:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": db_reason})})
-
-    product_id  = req.get("product_id", "")
-    coupon_code = req.get("coupon_code", "").strip()
-    if not coupon_code:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "no_code"})})
-
-    result = validate_coupon(coupon_code, product_id)
-    return JSONResponse({"data": aes_encrypt(result)})
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  ENDPOINT — /me  (customer self-service — OTP verified)
-# ═════════════════════════════════════════════════════════════════════════════
-
-@app.post("/me")
-async def ep_me(payload: Payload):
-    """
-    Returns all licenses, payment history and machine list for the identity.
-    Requires OTP verification first.
-
-    EXE sends: { identity, identity_type, timestamp }
-    Returns:   { ok, customer, licenses, payments, total_licenses, active_licenses }
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not valid_ts(req.get("timestamp", 0)):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "expired"})})
-
-    identity      = req.get("identity", "").strip()
-    identity_type = req.get("identity_type", "email").lower().strip()
-
-    if not identity:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "missing_fields"})})
-
-    ok_db, db_reason = _db_ok()
-    if not ok_db:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": db_reason})})
-
-    if not is_identity_verified(identity, identity_type):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "identity_not_verified"})})
-
-    result = get_customer_profile(identity, identity_type)
-    return JSONResponse({"data": aes_encrypt(result)})
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  ADMIN ENDPOINTS
-# ═════════════════════════════════════════════════════════════════════════════
-
-
-
-# ── Admin auth helper — accepts classic admin_token OR new session_token ──────
-def _admin_authed(req: dict) -> bool:
-    """
-    Returns True if the request carries valid admin credentials.
-    Accepts two forms:
-      - admin_token: the raw ADMIN_TOKEN value (classic, still supported)
-      - session_token: a time-limited HMAC token issued after OTP login
-    """
-    if req.get("admin_token") == ADMIN_TOKEN:
-        return True
-    st = req.get("session_token", "")
-    return bool(st) and _verify_session_token(st)
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  ADMIN — PRODUCT CRUD
-# ═════════════════════════════════════════════════════════════════════════════
-
-@app.post("/admin/product")
-async def admin_product_upsert(payload: Payload):
-    """
-    Create or update a product.
-    Sends: { admin_token, product_id, name, price_inr, price_usd,
-              razorpay_link?, gumroad_product_id?, gumroad_link?,
-              max_machines?, trial_days?, is_active? }
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not _admin_authed(req):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
-
-    product_id = req.get("product_id", "").strip().upper()
-    name       = req.get("name", "").strip()
-    if not product_id or not name:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "missing_fields"})})
-
-    result = upsert_product(
-        product_id         = product_id,
-        name               = name,
-        price_inr          = float(req.get("price_inr", 0)),
-        price_usd          = float(req.get("price_usd", 0)),
-        razorpay_link      = req.get("razorpay_link"),
-        gumroad_product_id = req.get("gumroad_product_id"),
-        gumroad_link       = req.get("gumroad_link"),
-        max_machines       = int(req.get("max_machines", 1)),
-        trial_days         = int(req.get("trial_days", 0)),
-        is_active          = int(req.get("is_active", 1)),
-    )
-    return JSONResponse({"data": aes_encrypt(result)})
-
-
-@app.post("/admin/product/delete")
-async def admin_product_delete(payload: Payload):
-    """Soft-delete a product. Sends: { admin_token, product_id }"""
-    req = aes_decrypt(payload.data)
-    if not req or not _admin_authed(req):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
-    result = delete_product(req.get("product_id", "").strip().upper())
-    return JSONResponse({"data": aes_encrypt(result)})
-
-
-@app.post("/admin/products")
-async def admin_list_products(payload: Payload):
-    """List all products. Sends: { admin_token, include_inactive? }"""
-    req = aes_decrypt(payload.data)
-    if not req or not _admin_authed(req):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
-    products = list_products(include_inactive=req.get("include_inactive", False))
-    return JSONResponse({"data": aes_encrypt({"ok": True, "products": products})})
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  ADMIN — COUPON MANAGEMENT
-# ═════════════════════════════════════════════════════════════════════════════
-
-@app.post("/admin/coupon")
-async def admin_create_coupon(payload: Payload):
-    """
-    Create a coupon code.
-    Sends: { admin_token, code, product_id?, discount_pct?,
-              discount_flat_inr?, discount_flat_usd?,
-              plan_override?, max_uses?, valid_from?, valid_until? }
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not _admin_authed(req):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
-
-    code = req.get("code", "").strip()
-    if not code:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "missing_code"})})
-
-    result = create_coupon(
-        code               = code,
-        product_id         = req.get("product_id"),
-        discount_pct       = float(req.get("discount_pct", 0)),
-        discount_flat_inr  = float(req.get("discount_flat_inr", 0)),
-        discount_flat_usd  = float(req.get("discount_flat_usd", 0)),
-        plan_override      = req.get("plan_override"),
-        max_uses           = int(req.get("max_uses", 1)),
-        valid_from         = req.get("valid_from"),
-        valid_until        = req.get("valid_until"),
-    )
-    return JSONResponse({"data": aes_encrypt(result)})
-
-
-@app.post("/admin/coupons")
-async def admin_list_coupons(payload: Payload):
-    """List all coupons. Sends: { admin_token }"""
-    req = aes_decrypt(payload.data)
-    if not req or not _admin_authed(req):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
-    return JSONResponse({"data": aes_encrypt({"ok": True, "coupons": list_coupons()})})
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  ADMIN — STATS
-# ═════════════════════════════════════════════════════════════════════════════
-
-@app.post("/admin/stats")
-async def admin_stats(payload: Payload):
-    """Returns dashboard numbers. Sends: { admin_token }"""
-    req = aes_decrypt(payload.data)
-    if not req or not _admin_authed(req):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
-    return JSONResponse({"data": aes_encrypt({"ok": True, **get_stats()})})
-
-@app.post("/admin/customer")
-async def admin_customer(payload: Payload):
-    """Look up full customer profile. Sends: { admin_token, identity, identity_type }"""
-    req = aes_decrypt(payload.data)
-    if not req or not _admin_authed(req):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
-    identity      = req.get("identity", "").strip()
-    identity_type = req.get("identity_type", "email").lower().strip()
-    from database import get_customer_profile
-    result = get_customer_profile(identity, identity_type)
-    return JSONResponse({"data": aes_encrypt(result)})
-
-
-@app.post("/admin/revoke")
-async def admin_revoke(payload: Payload):
-    """
-    Admin — revoke a license.
-
-    Sends (encrypted):
-        {
-          admin_token:    "xxx",
-          identity:       "user@gmail.com" OR "+919876543210",
-          identity_type:  "email" | "sms",   (default: "email")
-          product_id:     "TOOL1",            (optional — revokes all if omitted)
-          reason:         "manual" | "abuse" | "refund"
-        }
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not _admin_authed(req):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
-
-    identity      = req.get("identity", "").strip()
-    identity_type = req.get("identity_type", "email").lower().strip()
-    product_id    = req.get("product_id", None)
-    reason        = req.get("reason", "manual")
-
-    prod_name = "Your Tool"
-    if product_id:
-        prod = get_product(product_id)
-        if prod: prod_name = prod["name"]
-
-    n = revoke_license(identity, identity_type, product_id=product_id, reason=reason)
-    if n > 0:
-        notify_revoked(identity, identity_type, prod_name, reason)
-
-    return JSONResponse({"data": aes_encrypt({"ok": True, "revoked": n})})
-
-
-@app.post("/admin/refund")
-async def admin_refund(payload: Payload):
-    """
-    Admin — mark payment refunded, revoke license, notify customer.
-
-    Sends (encrypted):
-        {
-          admin_token:    "xxx",
-          payment_ref:    "pay_xxx",
-          identity:       "user@gmail.com",
-          identity_type:  "email",
-          product_name:   "Image Converter Pro"
-        }
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not _admin_authed(req):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
-
-    payment_ref   = req.get("payment_ref", "")
-    identity      = req.get("identity", "").strip()
-    identity_type = req.get("identity_type", "email").lower().strip()
-    product_name  = req.get("product_name", "Your Tool")
-
-    ok = mark_refunded(payment_ref)
-    if ok and identity:
-        notify_refund(identity, identity_type, product_name)
-
-    return JSONResponse({"data": aes_encrypt({"ok": ok, "refunded": ok})})
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  ADMIN — BACKUP DB
-# ═════════════════════════════════════════════════════════════════════════════
-
-@app.post("/admin/backup_db")
-async def admin_backup_db(payload: Payload):
-    """
-    Admin — trigger an immediate full backup right now.
-    Run this BEFORE every redeploy to ensure LIVE is up to date.
-
-    Sends (encrypted):
-        {
-          admin_token:  "xxx",
-          live:         true,   ← overwrite licenses_LIVE.db    (default true)
-          hist:         true    ← create   licenses_PREV_*.db   (default true)
-        }
-
-    Returns (encrypted):
-        { ok: true,  live: "licenses_LIVE.db", hist: "licenses_PREV_....db" }
-        { ok: false, error: "reason" }
-
-    Provider support:
-        sqlite     → uploads to Google Drive (requires backup_gdrive=true)
-        turso      → not needed (Turso is persistent, survives redeploys)
-        postgresql → planned (pg_dump to Drive)
-        mysql      → planned (mysqldump to Drive)
-        mongodb    → planned (mongodump to Drive)
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not _admin_authed(req):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
-
-    upload_live = req.get("live", True)
-    upload_hist = req.get("hist", True)
-
-    result = backup_db(upload_live=upload_live, upload_hist=upload_hist)
-    return JSONResponse({"data": aes_encrypt(result)})
-
-
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  ADMIN — READ-ONLY DATA BROWSER  (paginated, latest-first, 500 rows/page)
-# ═════════════════════════════════════════════════════════════════════════════
-
-import sqlite3 as _sqlite3
-
-def _sqlite_browse(sql_data: str, sql_count: str, params_data, params_count, offset: int, limit: int):
-    """Generic SQLite paginated fetch helper."""
-    try:
-        db_path = os.environ.get("DB_PATH", "licenses.db")
-        conn = _sqlite3.connect(db_path)
-        conn.row_factory = _sqlite3.Row
-        total = conn.execute(sql_count, params_count).fetchone()[0]
-        rows  = [dict(r) for r in conn.execute(sql_data, params_data).fetchall()]
-        conn.close()
-        return {"ok": True, "rows": rows, "total": total,
-                "offset": offset, "limit": limit,
-                "has_more": (offset + limit) < total}
-    except Exception as e:
-        return {"ok": False, "reason": str(e)}
-
-
-@app.post("/admin/browse/licenses")
-async def admin_browse_licenses(payload: Payload):
-    """
-    Read-only paginated license list. Latest activated first.
-    Sends: { admin_token, offset?, limit? }
-    Returns: { ok, rows, total, offset, limit, has_more }
-    Each row: product_id, identity, identity_type, plan, is_active,
-              activated_at, expires_at, last_seen_at, verify_count,
-              revoke_reason, source, amount, currency, machine_id
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not _admin_authed(req):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
-
-    offset = max(0, int(req.get("offset", 0)))
-    limit  = min(500, max(1, int(req.get("limit", 500))))
-
-    sql_data = """
-        SELECT l.product_id,
-               cu.identity, cu.identity_type,
-               l.plan, l.is_active, l.activated_at, l.expires_at,
-               l.last_seen_at, l.verify_count, l.revoke_reason,
-               l.machine_id, l.machine_label,
-               p.source, p.amount, p.currency, p.payment_ref
-        FROM licenses l
-        JOIN customers cu ON cu.id = l.customer_id
-        JOIN payments  p  ON p.id  = l.payment_id
-        ORDER BY l.activated_at DESC
-        LIMIT ? OFFSET ?
-    """
-    sql_count = "SELECT COUNT(*) FROM licenses"
-    result = _sqlite_browse(sql_data, sql_count, (limit, offset), (), offset, limit)
-    return JSONResponse({"data": aes_encrypt(result)})
-
-
-@app.post("/admin/browse/payments")
-async def admin_browse_payments(payload: Payload):
-    """
-    Read-only paginated payment list. Latest paid first.
-    Sends: { admin_token, offset?, limit? }
-    Returns: { ok, rows, total, offset, limit, has_more }
-    Each row: payment_ref, source, amount, currency, plan,
-              paid_at, is_refunded, identity, identity_type, product_id
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not _admin_authed(req):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
-
-    offset = max(0, int(req.get("offset", 0)))
-    limit  = min(500, max(1, int(req.get("limit", 500))))
-
-    sql_data = """
-        SELECT p.payment_ref, p.source, p.amount, p.currency, p.plan,
-               p.paid_at, p.is_refunded, p.refunded_at,
-               cu.identity, cu.identity_type, p.product_id
-        FROM payments p
-        JOIN customers cu ON cu.id = p.customer_id
-        ORDER BY p.paid_at DESC
-        LIMIT ? OFFSET ?
-    """
-    sql_count = "SELECT COUNT(*) FROM payments"
-    result = _sqlite_browse(sql_data, sql_count, (limit, offset), (), offset, limit)
-    return JSONResponse({"data": aes_encrypt(result)})
-
-
-@app.post("/admin/browse/customers")
-async def admin_browse_customers(payload: Payload):
-    """
-    Read-only paginated customer list. Newest first.
-    Sends: { admin_token, offset?, limit? }
-    Returns: { ok, rows, total, offset, limit, has_more }
-    Each row: identity, identity_type, created_at,
-              total_licenses, active_licenses
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not _admin_authed(req):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
-
-    offset = max(0, int(req.get("offset", 0)))
-    limit  = min(500, max(1, int(req.get("limit", 500))))
-
-    sql_data = """
-        SELECT cu.identity, cu.identity_type, cu.created_at,
-               COUNT(l.id)      AS total_licenses,
-               SUM(l.is_active) AS active_licenses
-        FROM customers cu
-        LEFT JOIN licenses l ON l.customer_id = cu.id
-        GROUP BY cu.id
-        ORDER BY cu.created_at DESC
-        LIMIT ? OFFSET ?
-    """
-    sql_count = "SELECT COUNT(*) FROM customers"
-    result = _sqlite_browse(sql_data, sql_count, (limit, offset), (), offset, limit)
-    return JSONResponse({"data": aes_encrypt(result)})
-
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  ADMIN AUTH — OTP LOGIN  (two-step: request OTP → verify OTP → session token)
-# ═════════════════════════════════════════════════════════════════════════════
-
-@app.post("/auth/admin/request-otp")
-async def admin_request_otp(payload: Payload):
-    """
-    Step 1 of admin login. Verifies ADMIN_TOKEN then sends OTP to ADMIN_EMAILS.
-
-    Sends (encrypted): { admin_token, timestamp }
-    Returns (encrypted):
-      { ok: true,  sent_to: ["a***@gmail.com", ...], otp_expires_in: 600 }
-      { ok: false, reason: "unauthorized" | "no_admin_email" | "delivery_failed" }
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not valid_ts(req.get("timestamp", 0)):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "expired"})})
-    if req.get("admin_token") != ADMIN_TOKEN:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
-    if not ADMIN_EMAILS:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "no_admin_email_configured"})})
-
-    otp = generate_otp()
-    _store_admin_otp(otp)
-
-    # Send OTP to all configured admin emails
-    subject  = f"Admin login code: {otp}"
-    html_body = f"""
-    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;
-                background:#0d1117;color:#e6edf3;border-radius:10px">
-        <h2 style="color:#58a6ff;margin-bottom:8px">⚙ License Server Admin Login</h2>
-        <p style="color:#8b949e;margin-bottom:20px">
-            Someone is attempting to log in to the admin dashboard.
-            If this was you, enter the code below.
-        </p>
-        <div style="font-size:44px;font-weight:bold;letter-spacing:14px;
-                    color:#58a6ff;background:#161b22;padding:24px;
-                    border-radius:10px;text-align:center;margin:16px 0;
-                    border:1px solid #30363d">
-            {otp}
-        </div>
-        <p style="color:#8b949e;font-size:13px">
-            This code expires in <b>10 minutes</b>.<br>
-            If you did not request this, someone may have your ADMIN_TOKEN — change it immediately.
-        </p>
+import os
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>License Server — Admin</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Inter',system-ui,sans-serif;background:#0d1117;color:#e6edf3;min-height:100vh}
+  .topbar{background:#161b22;border-bottom:1px solid #30363d;padding:14px 28px;
+          display:flex;align-items:center;gap:16px}
+  .topbar h1{font-size:16px;font-weight:600;color:#58a6ff}
+  .topbar span{font-size:12px;color:#8b949e}
+  .tabs{display:flex;gap:0;background:#161b22;border-bottom:1px solid #30363d;padding:0 28px}
+  .tab{padding:10px 18px;font-size:13px;cursor:pointer;border-bottom:2px solid transparent;
+       color:#8b949e;transition:.15s}
+  .tab:hover{color:#e6edf3}
+  .tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
+  .page{display:none;padding:28px;max-width:1200px}
+  .page.active{display:block}
+  .stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:16px;margin-bottom:28px}
+  .stat-card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px}
+  .stat-card .val{font-size:28px;font-weight:700;color:#58a6ff}
+  .stat-card .lbl{font-size:12px;color:#8b949e;margin-top:4px}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px;margin-bottom:20px}
+  .card h2{font-size:14px;font-weight:600;margin-bottom:14px;color:#e6edf3}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;padding:8px 12px;color:#8b949e;font-weight:500;
+     border-bottom:1px solid #30363d;font-size:12px}
+  td{padding:8px 12px;border-bottom:1px solid #21262d;vertical-align:middle}
+  tr:hover td{background:#1c2128}
+  .badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}
+  .badge-green{background:#033a16;color:#3fb950}
+  .badge-red{background:#3d1212;color:#f85149}
+  .badge-amber{background:#2d1f00;color:#d29922}
+  .badge-blue{background:#0c2d6b;color:#58a6ff}
+  .form-row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px}
+  .form-row label{font-size:12px;color:#8b949e;display:block;margin-bottom:4px}
+  .form-row input,.form-row select{background:#0d1117;border:1px solid #30363d;
+    color:#e6edf3;padding:7px 11px;border-radius:6px;font-size:13px;min-width:140px}
+  .btn{padding:7px 16px;border-radius:6px;border:none;font-size:13px;cursor:pointer;font-weight:500}
+  .btn-primary{background:#238636;color:#fff}.btn-primary:hover{background:#2ea043}
+  .btn-danger{background:#b91c1c;color:#fff}.btn-danger:hover{background:#dc2626}
+  .btn-secondary{background:#21262d;color:#e6edf3;border:1px solid #30363d}
+  .btn-secondary:hover{background:#30363d}
+  .msg{padding:10px 14px;border-radius:6px;font-size:13px;margin-bottom:14px}
+  .msg-ok{background:#033a16;color:#3fb950;border:1px solid #1a5c2a}
+  .msg-err{background:#3d1212;color:#f85149;border:1px solid #8b1a1a}
+  #login-overlay{position:fixed;inset:0;background:#0d1117;z-index:1000;
+    display:flex;align-items:flex-start;justify-content:center;
+    overflow-y:auto;padding:40px 16px}
+  .login-box{background:#161b22;border:1px solid #30363d;border-radius:12px;
+    padding:36px 40px;width:100%;max-width:420px;margin:auto}
+  .login-box h2{color:#58a6ff;font-size:20px;font-weight:600;margin-bottom:8px}
+  .login-box p.sub{color:#8b949e;font-size:13px;margin-bottom:28px}
+  .login-box button:hover:not(:disabled){background:#2ea043}
+  .login-box button:disabled{background:#21262d !important;color:#8b949e !important;cursor:default !important}
+  #login-err{color:#f85149;font-size:13px;margin-bottom:12px;min-height:20px;font-weight:500}
+  #login-step2{display:none}
+  .session-bar{font-size:12px;color:#8b949e;margin-left:auto;cursor:pointer}
+  .session-bar:hover{color:#e6edf3}
+  #loading{position:fixed;inset:0;background:rgba(13,17,23,.75);
+           display:none;align-items:center;justify-content:center;
+           font-size:14px;color:#58a6ff;z-index:500}
+</style>
+</head>
+<body>
+
+<!-- ── Login overlay ─────────────────────────────────────────────────────── -->
+<div id="login-overlay">
+  <div class="login-box">
+    <h2>⚙ Admin Login</h2>
+    <p class="sub">License Server Admin Dashboard</p>
+    <div id="login-err"></div>
+
+    <div id="login-step1" style="display:block">
+      <input type="password" id="l-pass" placeholder="Admin token / password"
+             onkeydown="if(event.key==='Enter')loginStep1()"
+             style="display:block;width:100%;background:#1c2128;border:2px solid #58a6ff;
+                    color:#e6edf3;padding:10px 14px;border-radius:6px;font-size:14px;
+                    margin-bottom:16px;box-sizing:border-box;outline:none"/>
+      <button id="l-btn1" onclick="loginStep1()"
+              style="display:block;width:100%;padding:12px;border-radius:6px;border:none;
+                     background:#238636;color:#fff;font-size:15px;font-weight:600;
+                     cursor:pointer;box-sizing:border-box">Continue &#8594;</button>
     </div>
-    """
-    failed = []
-    for email in ADMIN_EMAILS:
-        result = send_email(email, subject, html_body)
-        if not result["ok"]:
-            failed.append(email)
 
-    if len(failed) == len(ADMIN_EMAILS):
-        return JSONResponse({"data": aes_encrypt({
-            "ok": False, "reason": "delivery_failed",
-            "detail": "OTP could not be delivered to any admin email"
-        })})
+    <div id="login-step2" style="display:none">
+      <p id="l-otp-hint" style="color:#8b949e;font-size:13px;margin-bottom:16px"></p>
+      <input type="text" id="l-otp" placeholder="6-digit code"
+             maxlength="6"
+             oninput="this.value=this.value.replace(/\\D/g,'')"
+             onkeydown="if(event.key==='Enter')loginStep2()"
+             style="display:block;width:100%;background:#1c2128;border:2px solid #58a6ff;
+                    color:#e6edf3;padding:10px 14px;border-radius:6px;font-size:20px;
+                    letter-spacing:8px;text-align:center;margin-bottom:16px;
+                    box-sizing:border-box;outline:none"/>
+      <button id="l-btn2" onclick="loginStep2()"
+              style="display:block;width:100%;padding:12px;border-radius:6px;border:none;
+                     background:#238636;color:#fff;font-size:15px;font-weight:600;
+                     cursor:pointer;box-sizing:border-box">Verify &amp; Connect</button>
+      <p style="margin-top:14px;font-size:12px;color:#8b949e;text-align:center">
+        <span style="cursor:pointer;color:#58a6ff" onclick="loginReset()">&#8592; Back</span>
+        &nbsp;&#183;&nbsp;
+        <span style="cursor:pointer;color:#58a6ff" onclick="loginStep1()">Resend OTP</span>
+      </p>
+    </div>
+  </div>
+</div>
 
-    # Mask emails for response: alice@gmail.com → a***@gmail.com
-    def _mask(e):
-        parts = e.split("@")
-        return parts[0][0] + "***@" + parts[1] if len(parts)==2 else "***"
+<div id="loading">Loading…</div>
 
-    return JSONResponse({"data": aes_encrypt({
-        "ok":            True,
-        "sent_to":       [_mask(e) for e in ADMIN_EMAILS],
-        "otp_expires_in": 600,
-    })})
+<div class="topbar">
+  <h1>⚙ License Server Admin</h1>
+  <span id="health-badge">checking…</span>
+  <span class="session-bar" id="session-bar" onclick="doLogout()" title="Click to log out"></span>
+</div>
+<div class="tabs">
+  <div class="tab active" onclick="showTab('dashboard')">Dashboard</div>
+  <div class="tab" onclick="showTab('products')">Products</div>
+  <div class="tab" onclick="showTab('coupons')">Coupons</div>
+  <div class="tab" onclick="showTab('customers')">Customers</div>
+  <div class="tab" onclick="showTab('data')">📊 Data</div>
+</div>
 
+<!-- DASHBOARD -->
+<div class="page active" id="page-dashboard">
+  <div class="stat-grid" id="stats-grid"></div>
+  <div class="card"><h2>Quick Actions</h2>
+    <div class="form-row">
+      <div><label>Revoke license by email or phone</label>
+        <input type="text" id="revoke-email" placeholder="user@example.com or +91..." style="width:280px"/>
+      </div>
+      <div><label>Identity type</label>
+        <select id="revoke-itype">
+          <option value="email">email</option>
+          <option value="sms">sms (phone)</option>
+        </select>
+      </div>
+      <div><label>Product ID (blank=all)</label>
+        <input type="text" id="revoke-prod" placeholder="optional" style="width:140px"/>
+      </div>
+      <div><label>Reason</label>
+        <select id="revoke-reason">
+          <option value="manual">Manual</option>
+          <option value="abuse">Abuse</option>
+          <option value="refund">Refund</option>
+        </select>
+      </div>
+      <button class="btn btn-danger" onclick="revokeAction()">Revoke</button>
+    </div>
+    <div id="revoke-msg"></div>
+  </div>
+</div>
 
-@app.post("/auth/admin/verify-otp")
-async def admin_verify_otp(payload: Payload):
-    """
-    Step 2 of admin login. Verifies the OTP and returns a session token.
+<!-- PRODUCTS -->
+<div class="page" id="page-products">
+  <div class="card"><h2>Products</h2>
+    <div id="prod-msg"></div>
+    <div class="form-row">
+      <div><label>Product ID*</label><input id="p-id" placeholder="TOOL1"/></div>
+      <div><label>Name*</label><input id="p-name" placeholder="My Tool Pro" style="width:200px"/></div>
+      <div><label>Price INR</label><input id="p-inr" type="number" placeholder="499" style="width:100px"/></div>
+      <div><label>Price USD</label><input id="p-usd" type="number" placeholder="9.99" style="width:100px"/></div>
+      <div><label>Max Machines</label><input id="p-max" type="number" value="1" style="width:80px"/></div>
+      <div><label>Trial Days</label><input id="p-trial" type="number" value="0" style="width:80px"/></div>
+    </div>
+    <div class="form-row">
+      <div><label>Razorpay Link</label><input id="p-rzp" placeholder="https://rzp.io/l/..." style="width:260px"/></div>
+      <div><label>Gumroad Product ID</label><input id="p-gum-id" placeholder="abc123" style="width:140px"/></div>
+      <div><label>Gumroad Link</label><input id="p-gum-link" placeholder="https://..." style="width:220px"/></div>
+      <button class="btn btn-primary" onclick="saveProduct()">Save Product</button>
+    </div>
+    <table><thead><tr>
+      <th>ID</th><th>Name</th><th>INR</th><th>USD</th><th>Machines</th>
+      <th>Trial</th><th>Status</th><th>Actions</th>
+    </tr></thead><tbody id="prod-body"></tbody></table>
+  </div>
+</div>
 
-    Sends (encrypted): { admin_token, otp, timestamp }
-    Returns (encrypted):
-      { ok: true,  session_token: "...", expires_in: 1800 }
-      { ok: false, reason: "unauthorized" | "invalid_otp" | "otp_expired" |
-                           "max_attempts" | "not_requested" }
-    """
-    req = aes_decrypt(payload.data)
-    if not req or not valid_ts(req.get("timestamp", 0)):
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "expired"})})
-    if req.get("admin_token") != ADMIN_TOKEN:
-        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
+<!-- COUPONS -->
+<div class="page" id="page-coupons">
+  <div class="card"><h2>Coupons</h2>
+    <div id="coup-msg"></div>
+    <div class="form-row">
+      <div><label>Code*</label><input id="c-code" placeholder="LAUNCH20" style="text-transform:uppercase"/></div>
+      <div><label>Product ID (blank=all)</label><input id="c-prod" placeholder="optional"/></div>
+      <div><label>Discount %</label><input id="c-pct" type="number" value="0" style="width:80px"/></div>
+      <div><label>Flat INR off</label><input id="c-inr" type="number" value="0" style="width:90px"/></div>
+      <div><label>Flat USD off</label><input id="c-usd" type="number" value="0" style="width:90px"/></div>
+      <div><label>Plan Override</label>
+        <select id="c-plan">
+          <option value="">None</option>
+          <option value="trial">trial</option>
+          <option value="monthly">monthly</option>
+          <option value="annual">annual</option>
+          <option value="lifetime">lifetime</option>
+        </select>
+      </div>
+      <div><label>Max Uses</label><input id="c-uses" type="number" value="1" style="width:80px"/></div>
+      <div><label>Expires (unix ts)</label><input id="c-until" type="number" placeholder="optional" style="width:130px"/></div>
+      <button class="btn btn-primary" onclick="saveCoupon()">Create Coupon</button>
+    </div>
+    <table><thead><tr>
+      <th>Code</th><th>Product</th><th>Discount</th><th>Plan</th>
+      <th>Uses</th><th>Max</th><th>Expires</th><th>Status</th>
+    </tr></thead><tbody id="coup-body"></tbody></table>
+  </div>
+</div>
 
-    result = _verify_admin_otp(req.get("otp", "").strip())
-    if result != "ok":
-        reason_map = {
-            "invalid":      "invalid_otp",
-            "expired":      "otp_expired",
-            "max_attempts": "max_attempts_exceeded",
-            "not_requested":"otp_not_requested",
-        }
-        return JSONResponse({"data": aes_encrypt({
-            "ok": False, "reason": reason_map.get(result, result)
-        })})
+<!-- CUSTOMERS -->
+<div class="page" id="page-customers">
+  <div class="card"><h2>Customer Lookup</h2>
+    <div class="form-row">
+      <div><label>Email or Phone</label>
+        <input id="cust-search" placeholder="user@example.com" style="width:300px"/>
+      </div>
+      <select id="cust-type"><option value="email">email</option><option value="sms">sms</option></select>
+      <button class="btn btn-secondary" onclick="lookupCustomer()">Look up</button>
+    </div>
+    <div id="cust-result" style="margin-top:16px"></div>
+  </div>
+</div>
 
-    issued_at     = int(time.time())
-    session_token = _make_session_token(issued_at)
-    return JSONResponse({"data": aes_encrypt({
-        "ok":           True,
-        "session_token": session_token,
-        "expires_in":   ADMIN_SESSION_MINUTES * 60,
-    })})
+<!-- DATA BROWSER -->
+<div class="page" id="page-data">
+  <div style="display:flex;gap:0;border-bottom:1px solid #30363d;margin-bottom:20px">
+    <div class="tab active" id="dt-tab-lic"  onclick="dtSwitch('lic')"  style="padding:8px 16px">Licenses</div>
+    <div class="tab"        id="dt-tab-pay"  onclick="dtSwitch('pay')"  style="padding:8px 16px">Payments</div>
+    <div class="tab"        id="dt-tab-cust" onclick="dtSwitch('cust')" style="padding:8px 16px">Customers</div>
+  </div>
+  <div id="dt-lic">
+    <div class="card" style="padding:14px 20px;margin-bottom:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <span id="dt-lic-info" style="font-size:13px;color:#8b949e;flex:1">Click Load to fetch data</span>
+      <button class="btn btn-secondary" onclick="dtLoad('lic',-1)" id="dt-lic-prev" disabled>&#9664; Prev</button>
+      <button class="btn btn-secondary" onclick="dtLoad('lic', 1)" id="dt-lic-next" disabled>Next &#9654;</button>
+      <button class="btn btn-primary"   onclick="dtLoad('lic', 0)">Load / Refresh</button>
+    </div>
+    <div class="card" style="padding:0;overflow-x:auto">
+      <table><thead><tr>
+        <th>Activated</th><th>Identity</th><th>Ch</th><th>Product</th>
+        <th>Plan</th><th>Status</th><th>Source</th><th>Amount</th>
+        <th>Verifies</th><th>Last seen</th><th>Machine</th>
+      </tr></thead><tbody id="dt-lic-body">
+        <tr><td colspan="11" style="color:#8b949e;text-align:center;padding:32px">Click Load to fetch licenses</td></tr>
+      </tbody></table>
+    </div>
+  </div>
+  <div id="dt-pay" style="display:none">
+    <div class="card" style="padding:14px 20px;margin-bottom:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <span id="dt-pay-info" style="font-size:13px;color:#8b949e;flex:1">Click Load to fetch data</span>
+      <button class="btn btn-secondary" onclick="dtLoad('pay',-1)" id="dt-pay-prev" disabled>&#9664; Prev</button>
+      <button class="btn btn-secondary" onclick="dtLoad('pay', 1)" id="dt-pay-next" disabled>Next &#9654;</button>
+      <button class="btn btn-primary"   onclick="dtLoad('pay', 0)">Load / Refresh</button>
+    </div>
+    <div class="card" style="padding:0;overflow-x:auto">
+      <table><thead><tr>
+        <th>Paid at</th><th>Identity</th><th>Ch</th><th>Product</th>
+        <th>Source</th><th>Amount</th><th>Plan</th><th>Status</th><th>Payment ref</th>
+      </tr></thead><tbody id="dt-pay-body">
+        <tr><td colspan="9" style="color:#8b949e;text-align:center;padding:32px">Click Load to fetch payments</td></tr>
+      </tbody></table>
+    </div>
+  </div>
+  <div id="dt-cust" style="display:none">
+    <div class="card" style="padding:14px 20px;margin-bottom:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <span id="dt-cust-info" style="font-size:13px;color:#8b949e;flex:1">Click Load to fetch data</span>
+      <button class="btn btn-secondary" onclick="dtLoad('cust',-1)" id="dt-cust-prev" disabled>&#9664; Prev</button>
+      <button class="btn btn-secondary" onclick="dtLoad('cust', 1)" id="dt-cust-next" disabled>Next &#9654;</button>
+      <button class="btn btn-primary"   onclick="dtLoad('cust', 0)">Load / Refresh</button>
+    </div>
+    <div class="card" style="padding:0;overflow-x:auto">
+      <table><thead><tr>
+        <th>Joined</th><th>Identity</th><th>Ch</th>
+        <th>Active licenses</th><th>Total licenses</th>
+      </tr></thead><tbody id="dt-cust-body">
+        <tr><td colspan="5" style="color:#8b949e;text-align:center;padding:32px">Click Load to fetch customers</td></tr>
+      </tbody></table>
+    </div>
+  </div>
+</div>
 
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECURITY MODEL
+//  _sk   : CryptoKey (AES-GCM) — unwrapped from server using PBKDF2(password)
+//          Lives only in JS heap. Never in DOM, localStorage, or cookies.
+//  _tok  : session_token — HMAC-SHA256 signed by server, 30-min TTL.
+//  _pass : admin token — cleared from memory immediately after key unwrap.
+//
+//  SHARED_SECRET never appears in HTML source or any network response in
+//  plaintext. The server wraps it with a fresh random salt on every request
+//  to /admin/wrapped-secret. An attacker who intercepts the wrapped blob
+//  cannot use it without also knowing ADMIN_TOKEN.
+// ═══════════════════════════════════════════════════════════════════════════
+const base = window.location.origin;
+let _sk            = null;
+let _tok           = '';
+let _pass          = '';
+let _sessionExpiry = 0;
 
-@app.get("/auth/admin/wrapped-secret")
-async def admin_wrapped_secret():
-    """
-    Returns the SHARED_SECRET wrapped (AES-256-GCM encrypted) with a key derived
-    from ADMIN_TOKEN via PBKDF2-SHA256 (100,000 iterations).
+// ── AES-GCM encrypt/decrypt ──────────────────────────────────────────────────
+async function aesEncrypt(obj) {
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const pt    = new TextEncoder().encode(JSON.stringify(obj));
+  const ct    = new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv:nonce},_sk,pt));
+  const out   = new Uint8Array(12 + ct.length);
+  out.set(nonce); out.set(ct, 12);
+  let bin = '';
+  for (let i = 0; i < out.length; i++) bin += String.fromCharCode(out[i]);
+  return btoa(bin);
+}
 
-    The browser uses this to unwrap SHARED_SECRET client-side after the admin
-    enters their password — SHARED_SECRET itself never appears in the HTML or
-    any API response in plaintext.
+async function aesDecrypt(b64) {
+  const bin = atob(b64);
+  const raw = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) raw[i] = bin.charCodeAt(i);
+  const pt = await crypto.subtle.decrypt({name:'AES-GCM',iv:raw.slice(0,12)},_sk,raw.slice(12));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
 
-    Returns (plaintext JSON — this is safe because the wrapped secret is useless
-    without the ADMIN_TOKEN password):
-      { salt: "<hex>", wrapped: "<hex>", iterations: 100000 }
-    """
-    import os as _os
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    from cryptography.hazmat.primitives    import hashes as _hashes
-    from cryptography.hazmat.backends      import default_backend as _backend
+// ── Authenticated API call ────────────────────────────────────────────────────
+async function apiCall(endpoint, body) {
+  const payload = {...body, session_token: _tok, timestamp: Math.floor(Date.now()/1000)};
+  const r = await fetch(base + endpoint, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({data: await aesEncrypt(payload)})
+  });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => '');
+    throw new Error('HTTP ' + r.status + (txt ? ' — ' + txt.slice(0,120) : ''));
+  }
+  let j;
+  try { j = await r.json(); } catch(e) {
+    throw new Error('Server returned non-JSON (HTTP ' + r.status + ')');
+  }
+  if (!j || !j.data) throw new Error('Server response missing data field');
+  return await aesDecrypt(j.data);
+}
 
-    salt = _os.urandom(16)
-    kdf  = PBKDF2HMAC(
-        algorithm  = _hashes.SHA256(),
-        length     = 32,
-        salt       = salt,
-        iterations = 100_000,
-        backend    = _backend()
-    )
-    wrap_key  = kdf.derive(ADMIN_TOKEN.encode())
-    nonce     = _os.urandom(12)
-    ct        = AESGCM(wrap_key).encrypt(nonce, SHARED_SECRET, None)
-    return JSONResponse({
-        "salt":       salt.hex(),
-        "nonce":      nonce.hex(),
-        "wrapped":    ct.hex(),
-        "iterations": 100_000,
-    })
+// ── PBKDF2 key derivation (pure WebCrypto, no libraries) ─────────────────────
+async function pbkdf2Unwrap(password, saltHex, nonceHex, wrappedHex, iterations) {
+  const enc     = new TextEncoder();
+  const toArr   = hex => new Uint8Array(hex.match(/.{2}/g).map(b => parseInt(b,16)));
+  const baseKey = await crypto.subtle.importKey('raw', enc.encode(password),
+                    {name:'PBKDF2'}, false, ['deriveKey']);
+  const wrapKey = await crypto.subtle.deriveKey(
+    {name:'PBKDF2', salt:toArr(saltHex), iterations, hash:'SHA-256'},
+    baseKey, {name:'AES-GCM', length:256}, false, ['decrypt']
+  );
+  const skRaw = await crypto.subtle.decrypt(
+    {name:'AES-GCM', iv:toArr(nonceHex)}, wrapKey, toArr(wrappedHex)
+  );
+  return crypto.subtle.importKey('raw', skRaw, {name:'AES-GCM'}, false, ['encrypt','decrypt']);
+}
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  HEALTH
-# ═════════════════════════════════════════════════════════════════════════════
+// ── LOGIN STEP 1 — password + key unwrap + OTP request ───────────────────────
+function loginReset() {
+  _sk = null; _tok = ''; _pass = ''; _sessionExpiry = 0;
+  document.getElementById('login-step1').style.display = 'block';
+  document.getElementById('login-step2').style.display = 'none';
+  document.getElementById('login-err').textContent     = '';
+  document.getElementById('l-pass').value = '';
+  document.getElementById('l-otp').value  = '';
+  btnState('l-btn1', false); btnState('l-btn2', false);
+}
 
-@app.get("/health")
-async def health():
-    email_status = f"{len(EMAIL_SEND_METHODS)} method(s) configured" if EMAIL_SEND_METHODS else "not_configured"
-    sms_status   = f"{len(SMS_SEND_METHODS)} method(s) configured"   if SMS_SEND_METHODS   else "not_configured"
-    db_status    = "ok" if not _DB_INIT_ERROR else f"error: {_DB_INIT_ERROR}"
-    overall      = "ok" if not _DB_INIT_ERROR else "degraded"
-    return {
-        "status":    overall,
-        "time":      time.time(),
-        "test_mode": TEST_MODE,
-        "database":  db_status,
-        "email":     email_status,
-        "sms":       sms_status,
+function btnState(id, busy) {
+  const b = document.getElementById(id);
+  b.disabled    = busy;
+  b.textContent = busy
+    ? (id==='l-btn1' ? 'Sending OTP…' : 'Verifying…')
+    : (id==='l-btn1' ? 'Continue →' : 'Verify & Connect');
+}
+
+async function loginStep1() {
+  const pass = document.getElementById('l-pass').value.trim();
+  if (!pass) { document.getElementById('login-err').textContent = 'Enter your admin token'; return; }
+  _pass = pass;
+  document.getElementById('login-err').textContent = '';
+  btnState('l-btn1', true);
+  try {
+    // 1. Fetch wrapped secret (unauthenticated — safe, useless without password)
+    const wr = await fetch(base + '/auth/admin/wrapped-secret').then(r => {
+      if (!r.ok) throw new Error('Server unreachable (HTTP ' + r.status + ')');
+      return r.json();
+    });
+
+    // 2. Unwrap SHARED_SECRET using PBKDF2(password, salt)
+    try {
+      _sk = await pbkdf2Unwrap(_pass, wr.salt, wr.nonce, wr.wrapped, wr.iterations);
+    } catch(e) {
+      throw new Error('Wrong admin token — password incorrect');
     }
 
+    // 3. Request OTP (encrypted with just-unwrapped key)
+    const otpR = await apiCall('/auth/admin/request-otp', {admin_token: _pass});
+    if (!otpR.ok) {
+      _sk = null; _pass = '';
+      throw new Error(
+        otpR.reason === 'unauthorized'              ? 'Wrong admin token'
+      : otpR.reason === 'no_admin_email_configured' ? 'ADMIN_EMAILS not configured on server — add it to Railway env vars'
+      : otpR.reason === 'delivery_failed'           ? 'OTP email delivery failed — check EMAIL_SEND_METHODS'
+      : otpR.reason || 'OTP request failed'
+      );
+    }
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    // 4. Advance to OTP step
+    document.getElementById('l-otp-hint').textContent =
+      'OTP sent to: ' + (otpR.sent_to || []).join(', ');
+    document.getElementById('login-step1').style.display = 'none';
+    document.getElementById('login-step2').style.display = '';
+    setTimeout(() => document.getElementById('l-otp').focus(), 50);
+    btnState('l-btn1', false);
+
+  } catch(e) {
+    document.getElementById('login-err').textContent = e.message;
+    btnState('l-btn1', false);
+    _sk = null; _pass = '';
+  }
+}
+
+// ── LOGIN STEP 2 — OTP verify + receive session token ────────────────────────
+async function loginStep2() {
+  const otp = document.getElementById('l-otp').value.trim();
+  if (otp.length !== 6) { document.getElementById('login-err').textContent = 'Enter the 6-digit code'; return; }
+  document.getElementById('login-err').textContent = '';
+  btnState('l-btn2', true);
+  try {
+    const r = await apiCall('/auth/admin/verify-otp', {admin_token: _pass, otp});
+    if (!r.ok) {
+      throw new Error(
+        r.reason === 'invalid_otp'           ? 'Wrong code — check the email and try again'
+      : r.reason === 'otp_expired'           ? 'Code expired — click Resend OTP'
+      : r.reason === 'max_attempts_exceeded' ? 'Too many wrong attempts — click Resend OTP'
+      : r.reason === 'otp_not_requested'     ? 'No OTP was requested — go back and start over'
+      : r.reason || 'Verification failed'
+      );
+    }
+    _tok           = r.session_token;
+    _pass          = '';   // no longer needed — clear immediately
+    _sessionExpiry = Date.now() + r.expires_in * 1000;
+    document.getElementById('login-overlay').style.display = 'none';
+    startSessionTimer();
+    afterLogin();
+  } catch(e) {
+    document.getElementById('login-err').textContent = e.message;
+    btnState('l-btn2', false);
+  }
+}
+
+// ── Session countdown in topbar ───────────────────────────────────────────────
+function startSessionTimer() {
+  const el   = document.getElementById('session-bar');
+  const tick = () => {
+    const left = Math.max(0, Math.round((_sessionExpiry - Date.now()) / 1000));
+    if (left === 0) { doLogout(); return; }
+    const m = Math.floor(left/60), s = (left%60).toString().padStart(2,'0');
+    el.textContent = 'Session: ' + m + ':' + s + '  \u00b7  Log out';
+    setTimeout(tick, 1000);
+  };
+  tick();
+}
+
+function doLogout() {
+  _sk = null; _tok = ''; _pass = ''; _sessionExpiry = 0;
+  document.getElementById('login-overlay').style.display = 'flex';
+  loginReset();
+}
+
+// ── After login — load initial data ──────────────────────────────────────────
+async function afterLogin() {
+  document.getElementById('loading').style.display = 'flex';
+  try {
+    const s = await apiCall('/admin/stats', {});
+    if (s.ok) renderStats(s);
+    await Promise.all([loadProducts(), loadCoupons()]);
+  } catch(e) { console.error('afterLogin:', e); }
+  finally { document.getElementById('loading').style.display = 'none'; }
+}
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
+function showTab(t) {
+  document.querySelectorAll('.tabs > .tab').forEach(e => {
+    const name = e.textContent.trim().toLowerCase().replace(/^📊 /,'');
+    e.classList.toggle('active', name === t);
+  });
+  document.querySelectorAll('.page').forEach(e =>
+    e.classList.toggle('active', e.id === 'page-' + t));
+}
+
+// ── Stats ─────────────────────────────────────────────────────────────────────
+function renderStats(s) {
+  document.getElementById('stats-grid').innerHTML = [
+    ['Total Customers',  s.total_customers   ?? 0, 'blue'],
+    ['Active Licenses',  s.active_licenses   ?? 0, 'green'],
+    ['Trial Licenses',   s.trial_licenses    ?? 0, 'amber'],
+    ['Revenue INR',     '&#8377;'+(s.revenue_inr ??0).toFixed(2), 'green'],
+    ['Revenue USD',     '$'+(s.revenue_usd  ??0).toFixed(2), 'blue'],
+    ['Total Payments',   s.total_payments    ?? 0, ''],
+    ['Refunds',          s.refunds           ?? 0, s.refunds?'red':''],
+    ['Coupons Used',     s.coupons_redeemed  ?? 0, 'amber'],
+    ['OTPs (24h)',       s.otps_sent_last_24h?? 0, ''],
+  ].map(([l,v,c]) => `<div class="stat-card">
+    <div class="val" style="${c==='green'?'color:#3fb950':c==='red'?'color:#f85149':c==='amber'?'color:#d29922':''}">${v}</div>
+    <div class="lbl">${l}</div></div>`).join('');
+}
+
+// ── Products ──────────────────────────────────────────────────────────────────
+async function loadProducts() {
+  const r = await apiCall('/admin/products', {include_inactive:true});
+  if (!r.ok) return;
+  document.getElementById('prod-body').innerHTML = r.products.map(p => `<tr>
+    <td><code>${p.product_id}</code></td><td>${p.name}</td>
+    <td>&#8377;${p.price_inr||0}</td><td>$${p.price_usd||0}</td>
+    <td>${p.max_machines}</td><td>${p.trial_days||0}d</td>
+    <td><span class="badge ${p.is_active?'badge-green':'badge-red'}">${p.is_active?'Active':'Inactive'}</span></td>
+    <td>
+      <button class="btn btn-secondary" style="font-size:11px;padding:4px 10px"
+        onclick="fillProduct(${JSON.stringify(p).replace(/"/g,'&quot;')})">Edit</button>
+      <button class="btn btn-danger" style="font-size:11px;padding:4px 10px;margin-left:4px"
+        onclick="delProduct('${p.product_id}')">Del</button>
+    </td></tr>`).join('');
+}
+function fillProduct(p) {
+  ['p-id','p-name','p-inr','p-usd','p-max','p-trial','p-rzp','p-gum-id','p-gum-link'].forEach(id => {
+    const key = {
+      'p-id':'product_id','p-name':'name','p-inr':'price_inr','p-usd':'price_usd',
+      'p-max':'max_machines','p-trial':'trial_days','p-rzp':'razorpay_link',
+      'p-gum-id':'gumroad_product_id','p-gum-link':'gumroad_link'
+    }[id];
+    document.getElementById(id).value = p[key] || (typeof p[key]==='number'?p[key]:'');
+  });
+  showTab('products');
+}
+async function saveProduct() {
+  const r = await apiCall('/admin/product', {
+    product_id: document.getElementById('p-id').value.trim().toUpperCase(),
+    name:       document.getElementById('p-name').value.trim(),
+    price_inr: +document.getElementById('p-inr').value,
+    price_usd: +document.getElementById('p-usd').value,
+    max_machines: +document.getElementById('p-max').value,
+    trial_days:   +document.getElementById('p-trial').value,
+    razorpay_link:      document.getElementById('p-rzp').value.trim()||null,
+    gumroad_product_id: document.getElementById('p-gum-id').value.trim()||null,
+    gumroad_link:       document.getElementById('p-gum-link').value.trim()||null,
+  });
+  const m = document.getElementById('prod-msg');
+  m.className = 'msg '+(r.ok?'msg-ok':'msg-err');
+  m.textContent = r.ok ? (r.created?'&#10003; Product created':'&#10003; Product updated') : '&#10007; '+r.reason;
+  if (r.ok) loadProducts();
+}
+async function delProduct(id) {
+  if (!confirm('Soft-delete '+id+'? Licenses are preserved.')) return;
+  const r = await apiCall('/admin/product/delete', {product_id:id});
+  if (r.ok) loadProducts();
+}
+
+// ── Coupons ───────────────────────────────────────────────────────────────────
+async function loadCoupons() {
+  const r = await apiCall('/admin/coupons', {});
+  if (!r.ok) return;
+  document.getElementById('coup-body').innerHTML = r.coupons.map(c => `<tr>
+    <td><code>${c.code}</code></td>
+    <td>${c.product_id||'All'}</td>
+    <td>${c.discount_pct?c.discount_pct+'%':''} ${c.discount_flat_inr?'&#8377;'+c.discount_flat_inr:''} ${c.discount_flat_usd?'$'+c.discount_flat_usd:''}</td>
+    <td>${c.plan_override||'&#8212;'}</td>
+    <td>${c.uses}</td><td>${c.max_uses}</td>
+    <td>${fmt_ts(c.valid_until)}</td>
+    <td><span class="badge ${c.is_active&&c.uses<c.max_uses?'badge-green':'badge-red'}">${c.is_active&&c.uses<c.max_uses?'Active':'Done'}</span></td>
+    </tr>`).join('');
+}
+async function saveCoupon() {
+  const r = await apiCall('/admin/coupon', {
+    code:              document.getElementById('c-code').value.trim(),
+    product_id:        document.getElementById('c-prod').value.trim()||null,
+    discount_pct:     +document.getElementById('c-pct').value,
+    discount_flat_inr:+document.getElementById('c-inr').value,
+    discount_flat_usd:+document.getElementById('c-usd').value,
+    plan_override:     document.getElementById('c-plan').value||null,
+    max_uses:         +document.getElementById('c-uses').value,
+    valid_until:      +document.getElementById('c-until').value||null,
+  });
+  const m = document.getElementById('coup-msg');
+  m.className = 'msg '+(r.ok?'msg-ok':'msg-err');
+  m.textContent = r.ok
+    ? '&#10003; Coupon '+document.getElementById('c-code').value.trim().toUpperCase()+' created'
+    : '&#10007; '+r.reason;
+  if (r.ok) loadCoupons();
+}
+
+// ── Revoke ────────────────────────────────────────────────────────────────────
+async function revokeAction() {
+  const identity = document.getElementById('revoke-email').value.trim();
+  if (!identity) return;
+  const r = await apiCall('/admin/revoke', {
+    identity,
+    identity_type: document.getElementById('revoke-itype').value,
+    product_id:    document.getElementById('revoke-prod').value.trim()||null,
+    reason:        document.getElementById('revoke-reason').value,
+  });
+  const m = document.getElementById('revoke-msg');
+  m.className = 'msg '+(r.ok?'msg-ok':'msg-err');
+  m.textContent = r.ok ? '&#10003; Revoked '+r.revoked+' license(s)' : '&#10007; '+r.reason;
+}
+
+// ── Customer lookup ───────────────────────────────────────────────────────────
+async function lookupCustomer() {
+  const identity = document.getElementById('cust-search').value.trim();
+  if (!identity) return;
+  const r  = await apiCall('/admin/customer', {
+    identity, identity_type: document.getElementById('cust-type').value
+  });
+  const el = document.getElementById('cust-result');
+  if (!r.ok) { el.innerHTML = '<div class="msg msg-err">&#10007; '+r.reason+'</div>'; return; }
+  const c = r.customer;
+  el.innerHTML = `<div class="card">
+    <h2>${c.identity} &#8212; member since ${fmt_ts(c.member_since)}</h2>
+    <p style="font-size:13px;color:#8b949e;margin:8px 0">${r.active_licenses} active / ${r.total_licenses} total</p>
+    <table><thead><tr><th>Product</th><th>Plan</th><th>Activated</th><th>Expires</th><th>Days Left</th><th>Status</th></tr></thead>
+    <tbody>${r.licenses.map(l=>`<tr>
+      <td>${l.product_name||l.product_id}</td>
+      <td><span class="badge badge-blue">${l.plan}</span></td>
+      <td>${fmt_ts(l.activated_at)}</td><td>${fmt_ts(l.expires_at)}</td>
+      <td>${l.days_left!=null?l.days_left+'d':'&#8734;'}</td>
+      <td><span class="badge ${l.is_active&&!l.is_expired?'badge-green':'badge-red'}">${l.is_active&&!l.is_expired?'Active':l.is_expired?'Expired':'Revoked'}</span></td>
+    </tr>`).join('')}</tbody></table></div>`;
+}
+
+// ── Data browser ──────────────────────────────────────────────────────────────
+const DT_PAGE = 500;
+const dtState = {
+  lic: {offset:0,total:0,loaded:false},
+  pay: {offset:0,total:0,loaded:false},
+  cust:{offset:0,total:0,loaded:false}
+};
+const dtEp = {lic:'licenses',pay:'payments',cust:'customers'};
+
+function dtSwitch(v) {
+  ['lic','pay','cust'].forEach(x => {
+    document.getElementById('dt-'+x).style.display = x===v?'':'none';
+    document.getElementById('dt-tab-'+x).classList.toggle('active', x===v);
+  });
+  if (!dtState[v].loaded) dtLoad(v, 0);
+}
+
+async function dtLoad(v, dir) {
+  const st = dtState[v];
+  if (dir===0) st.offset=0;
+  else if (dir===1)  st.offset = Math.min(st.offset+DT_PAGE, Math.max(0,st.total-DT_PAGE));
+  else if (dir===-1) st.offset = Math.max(0, st.offset-DT_PAGE);
+  const info = document.getElementById('dt-'+v+'-info');
+  const prev = document.getElementById('dt-'+v+'-prev');
+  const next = document.getElementById('dt-'+v+'-next');
+  const body = document.getElementById('dt-'+v+'-body');
+  info.textContent='Loading…'; prev.disabled=true; next.disabled=true;
+  try {
+    const r = await apiCall('/admin/browse/'+dtEp[v], {offset:st.offset, limit:DT_PAGE});
+    if (!r.ok) { info.textContent='Error: '+(r.reason||'unknown'); return; }
+    st.total=r.total; st.loaded=true;
+    const from=st.offset+1, to=Math.min(st.offset+r.rows.length,r.total);
+    info.textContent = r.total===0 ? 'No records'
+      : 'Showing '+from+'&#8211;'+to+' of '+r.total+' (latest first)';
+    prev.disabled = st.offset<=0;
+    next.disabled = !r.has_more;
+    if (v==='lic')  body.innerHTML = dtLic(r.rows);
+    if (v==='pay')  body.innerHTML = dtPay(r.rows);
+    if (v==='cust') body.innerHTML = dtCust(r.rows);
+  } catch(e) { info.textContent='Error: '+e.message; }
+}
+
+function chB(t){ return t==='email'?'<span style="color:#58a6ff;font-size:11px">&#9993;</span>':'<span style="color:#3fb950;font-size:11px">&#128241;</span>'; }
+
+function dtLic(rows) {
+  if (!rows.length) return '<tr><td colspan="11" style="color:#8b949e;text-align:center;padding:24px">No licenses</td></tr>';
+  return rows.map(r=>{
+    const st = !r.is_active?'<span class="badge badge-red">Revoked</span>'
+      :r.expires_at&&Date.now()/1000>r.expires_at?'<span class="badge badge-amber">Expired</span>'
+      :'<span class="badge badge-green">Active</span>';
+    const amt=r.currency==='INR'?'&#8377;'+(r.amount||0):'$'+(r.amount||0);
+    const mc=r.machine_label||(r.machine_id?r.machine_id.slice(0,12)+'&#8230;':'&#8212;');
+    return `<tr>
+      <td style="white-space:nowrap">${fmt_ts(r.activated_at)}</td>
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${r.identity}">${r.identity}</td>
+      <td>${chB(r.identity_type)}</td><td><code>${r.product_id}</code></td>
+      <td><span class="badge badge-blue">${r.plan}</span></td><td>${st}</td>
+      <td style="font-size:11px;color:#8b949e">${r.source||'&#8212;'}</td>
+      <td style="white-space:nowrap">${amt} ${r.currency||''}</td>
+      <td style="text-align:center">${r.verify_count||0}</td>
+      <td style="white-space:nowrap;color:#8b949e;font-size:12px">${fmt_ts(r.last_seen_at)}</td>
+      <td style="font-size:11px;color:#8b949e;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+          title="${r.machine_label||r.machine_id||''}">${mc}</td></tr>`;
+  }).join('');
+}
+function dtPay(rows) {
+  if (!rows.length) return '<tr><td colspan="9" style="color:#8b949e;text-align:center;padding:24px">No payments</td></tr>';
+  return rows.map(r=>{
+    const st=r.is_refunded?'<span class="badge badge-red">Refunded</span>':'<span class="badge badge-green">Paid</span>';
+    const amt=r.currency==='INR'?'&#8377;'+r.amount:'$'+r.amount;
+    return `<tr>
+      <td style="white-space:nowrap">${fmt_ts(r.paid_at)}</td>
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${r.identity}">${r.identity}</td>
+      <td>${chB(r.identity_type)}</td><td><code>${r.product_id}</code></td>
+      <td style="font-size:11px;color:#8b949e">${r.source}</td>
+      <td style="white-space:nowrap">${amt}</td>
+      <td><span class="badge badge-blue">${r.plan}</span></td><td>${st}</td>
+      <td style="font-size:11px;color:#8b949e;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+          title="${r.payment_ref}">${r.payment_ref}</td></tr>`;
+  }).join('');
+}
+function dtCust(rows) {
+  if (!rows.length) return '<tr><td colspan="5" style="color:#8b949e;text-align:center;padding:24px">No customers</td></tr>';
+  return rows.map(r=>{
+    const a=r.active_licenses||0, t=r.total_licenses||0;
+    return `<tr>
+      <td style="white-space:nowrap">${fmt_ts(r.created_at)}</td>
+      <td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${r.identity}">${r.identity}</td>
+      <td>${chB(r.identity_type)}</td>
+      <td style="text-align:center"><span class="badge ${a>0?'badge-green':'badge-red'}">${a}</span></td>
+      <td style="text-align:center;color:#8b949e">${t}</td></tr>`;
+  }).join('');
+}
+
+// ── Utility ───────────────────────────────────────────────────────────────────
+function fmt_ts(ts) {
+  if (!ts) return '&#8212;';
+  return new Date(ts*1000).toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});
+}
+
+// ── Health check on page load (no auth needed) ────────────────────────────────
+fetch(base+'/health').then(r=>r.json()).then(h=>{
+  const el = document.getElementById('health-badge');
+  el.textContent = h.status==='ok' ? '\u25cf Server OK' : '\u26a0 '+h.status;
+  el.style.color  = h.status==='ok' ? '#3fb950' : '#d29922';
+}).catch(()=>{
+  document.getElementById('health-badge').textContent = '\u2716 Server unreachable';
+});
+</script>
+</body>
+</html>"""
+
+
+admin_app = FastAPI()
+
+@admin_app.get("/ui", response_class=HTMLResponse)
+async def admin_ui(request: Request):
+    """
+    Serves the admin dashboard HTML.
+    No secrets are injected into the page — zero.
+    The browser obtains the AES key by:
+      1. Calling GET /admin/wrapped-secret (returns PBKDF2-wrapped key)
+      2. Deriving the unwrap key from the admin password via WebCrypto PBKDF2
+      3. Decrypting the wrapper to get SHARED_SECRET as a CryptoKey in memory
+    """
+    return HTMLResponse(DASHBOARD_HTML)
