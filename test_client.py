@@ -46,6 +46,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # ── Config ──────────────────────────────────────────────────────────────────────
 
+#RR1SC2KKOsrBxEN8s-IaLwGWKZuEQkoKnfnFld3wgjvKPFDM0OY9I5RY_nthLbq6x0yFIK-rkp6iqTfhQ7H65_IcOxEj0pj7_QAEHNNi2lbNa2IZeV5xqZfxhY-2XMux
+
 SERVER       = os.environ.get("SERVER",       "https://web-production-b851a.up.railway.app")
 SECRET_HEX   = os.environ.get("SHARED_SECRET",
                "fc0e3b19df3e631af37bc862707adce87ad8a571872224ad88dee54e3e958b9c")

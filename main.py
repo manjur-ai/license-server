@@ -64,6 +64,66 @@ SUPPORT_EMAIL       = os.environ.get("SUPPORT_EMAIL",       "support@toolfy.com"
 TEST_MODE           = os.environ.get("TEST_MODE", "false").lower() == "true"
 MAX_TS_DRIFT        = 30
 
+# ── Admin auth: email(s) that receive the login OTP ──────────────────────────
+# Set ADMIN_EMAILS as comma-separated list: "alice@gmail.com,bob@gmail.com"
+# Falls back to SUPPORT_EMAIL if not set.
+ADMIN_EMAILS: list = [
+    e.strip() for e in
+    os.environ.get("ADMIN_EMAILS", os.environ.get("SUPPORT_EMAIL", "")).split(",")
+    if e.strip()
+]
+
+# ── Admin session tokens: stateless HMAC, 30-minute validity ─────────────────
+ADMIN_SESSION_MINUTES = 30
+
+def _make_session_token(issued_at: int) -> str:
+    """Create a session token: HMAC-SHA256(secret, 'admin-session:' + issued_at)."""
+    msg = f"admin-session:{issued_at}".encode()
+    return hmac.new(SHARED_SECRET, msg, hashlib.sha256).hexdigest() + f":{issued_at}"
+
+def _verify_session_token(token: str) -> bool:
+    """Verify a session token and check it is within ADMIN_SESSION_MINUTES."""
+    try:
+        sig, issued_str = token.rsplit(":", 1)
+        issued_at = int(issued_str)
+        if abs(time.time() - issued_at) > ADMIN_SESSION_MINUTES * 60:
+            return False
+        expected = hmac.new(SHARED_SECRET,
+                            f"admin-session:{issued_at}".encode(),
+                            hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig, expected)
+    except Exception:
+        return False
+
+# Temporary OTP store for admin login (in-memory, keyed by HMAC of admin_token)
+import threading as _threading
+_admin_otp_store: dict = {}
+_admin_otp_lock  = _threading.Lock()
+
+def _store_admin_otp(otp: str):
+    with _admin_otp_lock:
+        _admin_otp_store["otp"]        = otp
+        _admin_otp_store["issued_at"]  = time.time()
+        _admin_otp_store["attempts"]   = 0
+
+def _verify_admin_otp(otp: str) -> str:
+    """Returns 'ok', 'expired', 'invalid', or 'max_attempts'."""
+    with _admin_otp_lock:
+        entry = _admin_otp_store.copy()
+    if not entry:
+        return "not_requested"
+    if time.time() - entry.get("issued_at", 0) > 600:   # 10 min expiry
+        return "expired"
+    if entry.get("attempts", 0) >= 5:
+        return "max_attempts"
+    with _admin_otp_lock:
+        _admin_otp_store["attempts"] = entry["attempts"] + 1
+    if hmac.compare_digest(otp.strip(), entry.get("otp", "")):
+        with _admin_otp_lock:
+            _admin_otp_store.clear()   # one-time use
+        return "ok"
+    return "invalid"
+
 # ── Crypto ────────────────────────────────────────────────────────────────────
 
 def aes_decrypt(b64: str) -> dict:
@@ -763,6 +823,20 @@ async def ep_me(payload: Payload):
 # ═════════════════════════════════════════════════════════════════════════════
 
 
+
+# ── Admin auth helper — accepts classic admin_token OR new session_token ──────
+def _admin_authed(req: dict) -> bool:
+    """
+    Returns True if the request carries valid admin credentials.
+    Accepts two forms:
+      - admin_token: the raw ADMIN_TOKEN value (classic, still supported)
+      - session_token: a time-limited HMAC token issued after OTP login
+    """
+    if req.get("admin_token") == ADMIN_TOKEN:
+        return True
+    st = req.get("session_token", "")
+    return bool(st) and _verify_session_token(st)
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  ADMIN — PRODUCT CRUD
 # ═════════════════════════════════════════════════════════════════════════════
@@ -776,7 +850,7 @@ async def admin_product_upsert(payload: Payload):
               max_machines?, trial_days?, is_active? }
     """
     req = aes_decrypt(payload.data)
-    if not req or req.get("admin_token") != ADMIN_TOKEN:
+    if not req or not _admin_authed(req):
         return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
 
     product_id = req.get("product_id", "").strip().upper()
@@ -803,7 +877,7 @@ async def admin_product_upsert(payload: Payload):
 async def admin_product_delete(payload: Payload):
     """Soft-delete a product. Sends: { admin_token, product_id }"""
     req = aes_decrypt(payload.data)
-    if not req or req.get("admin_token") != ADMIN_TOKEN:
+    if not req or not _admin_authed(req):
         return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
     result = delete_product(req.get("product_id", "").strip().upper())
     return JSONResponse({"data": aes_encrypt(result)})
@@ -813,7 +887,7 @@ async def admin_product_delete(payload: Payload):
 async def admin_list_products(payload: Payload):
     """List all products. Sends: { admin_token, include_inactive? }"""
     req = aes_decrypt(payload.data)
-    if not req or req.get("admin_token") != ADMIN_TOKEN:
+    if not req or not _admin_authed(req):
         return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
     products = list_products(include_inactive=req.get("include_inactive", False))
     return JSONResponse({"data": aes_encrypt({"ok": True, "products": products})})
@@ -832,7 +906,7 @@ async def admin_create_coupon(payload: Payload):
               plan_override?, max_uses?, valid_from?, valid_until? }
     """
     req = aes_decrypt(payload.data)
-    if not req or req.get("admin_token") != ADMIN_TOKEN:
+    if not req or not _admin_authed(req):
         return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
 
     code = req.get("code", "").strip()
@@ -857,7 +931,7 @@ async def admin_create_coupon(payload: Payload):
 async def admin_list_coupons(payload: Payload):
     """List all coupons. Sends: { admin_token }"""
     req = aes_decrypt(payload.data)
-    if not req or req.get("admin_token") != ADMIN_TOKEN:
+    if not req or not _admin_authed(req):
         return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
     return JSONResponse({"data": aes_encrypt({"ok": True, "coupons": list_coupons()})})
 
@@ -870,7 +944,7 @@ async def admin_list_coupons(payload: Payload):
 async def admin_stats(payload: Payload):
     """Returns dashboard numbers. Sends: { admin_token }"""
     req = aes_decrypt(payload.data)
-    if not req or req.get("admin_token") != ADMIN_TOKEN:
+    if not req or not _admin_authed(req):
         return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
     return JSONResponse({"data": aes_encrypt({"ok": True, **get_stats()})})
 
@@ -878,7 +952,7 @@ async def admin_stats(payload: Payload):
 async def admin_customer(payload: Payload):
     """Look up full customer profile. Sends: { admin_token, identity, identity_type }"""
     req = aes_decrypt(payload.data)
-    if not req or req.get("admin_token") != ADMIN_TOKEN:
+    if not req or not _admin_authed(req):
         return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
     identity      = req.get("identity", "").strip()
     identity_type = req.get("identity_type", "email").lower().strip()
@@ -902,7 +976,7 @@ async def admin_revoke(payload: Payload):
         }
     """
     req = aes_decrypt(payload.data)
-    if not req or req.get("admin_token") != ADMIN_TOKEN:
+    if not req or not _admin_authed(req):
         return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
 
     identity      = req.get("identity", "").strip()
@@ -937,7 +1011,7 @@ async def admin_refund(payload: Payload):
         }
     """
     req = aes_decrypt(payload.data)
-    if not req or req.get("admin_token") != ADMIN_TOKEN:
+    if not req or not _admin_authed(req):
         return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
 
     payment_ref   = req.get("payment_ref", "")
@@ -981,7 +1055,7 @@ async def admin_backup_db(payload: Payload):
         mongodb    → planned (mongodump to Drive)
     """
     req = aes_decrypt(payload.data)
-    if not req or req.get("admin_token") != ADMIN_TOKEN:
+    if not req or not _admin_authed(req):
         return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
 
     upload_live = req.get("live", True)
@@ -1026,7 +1100,7 @@ async def admin_browse_licenses(payload: Payload):
               revoke_reason, source, amount, currency, machine_id
     """
     req = aes_decrypt(payload.data)
-    if not req or req.get("admin_token") != ADMIN_TOKEN:
+    if not req or not _admin_authed(req):
         return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
 
     offset = max(0, int(req.get("offset", 0)))
@@ -1060,7 +1134,7 @@ async def admin_browse_payments(payload: Payload):
               paid_at, is_refunded, identity, identity_type, product_id
     """
     req = aes_decrypt(payload.data)
-    if not req or req.get("admin_token") != ADMIN_TOKEN:
+    if not req or not _admin_authed(req):
         return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
 
     offset = max(0, int(req.get("offset", 0)))
@@ -1090,7 +1164,7 @@ async def admin_browse_customers(payload: Payload):
               total_licenses, active_licenses
     """
     req = aes_decrypt(payload.data)
-    if not req or req.get("admin_token") != ADMIN_TOKEN:
+    if not req or not _admin_authed(req):
         return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
 
     offset = max(0, int(req.get("offset", 0)))
@@ -1110,6 +1184,153 @@ async def admin_browse_customers(payload: Payload):
     result = _sqlite_browse(sql_data, sql_count, (limit, offset), (), offset, limit)
     return JSONResponse({"data": aes_encrypt(result)})
 
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ADMIN AUTH — OTP LOGIN  (two-step: request OTP → verify OTP → session token)
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.post("/admin/request-otp")
+async def admin_request_otp(payload: Payload):
+    """
+    Step 1 of admin login. Verifies ADMIN_TOKEN then sends OTP to ADMIN_EMAILS.
+
+    Sends (encrypted): { admin_token, timestamp }
+    Returns (encrypted):
+      { ok: true,  sent_to: ["a***@gmail.com", ...], otp_expires_in: 600 }
+      { ok: false, reason: "unauthorized" | "no_admin_email" | "delivery_failed" }
+    """
+    req = aes_decrypt(payload.data)
+    if not req or not valid_ts(req.get("timestamp", 0)):
+        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "expired"})})
+    if req.get("admin_token") != ADMIN_TOKEN:
+        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
+    if not ADMIN_EMAILS:
+        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "no_admin_email_configured"})})
+
+    otp = generate_otp()
+    _store_admin_otp(otp)
+
+    # Send OTP to all configured admin emails
+    subject  = f"Admin login code: {otp}"
+    html_body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;
+                background:#0d1117;color:#e6edf3;border-radius:10px">
+        <h2 style="color:#58a6ff;margin-bottom:8px">⚙ License Server Admin Login</h2>
+        <p style="color:#8b949e;margin-bottom:20px">
+            Someone is attempting to log in to the admin dashboard.
+            If this was you, enter the code below.
+        </p>
+        <div style="font-size:44px;font-weight:bold;letter-spacing:14px;
+                    color:#58a6ff;background:#161b22;padding:24px;
+                    border-radius:10px;text-align:center;margin:16px 0;
+                    border:1px solid #30363d">
+            {otp}
+        </div>
+        <p style="color:#8b949e;font-size:13px">
+            This code expires in <b>10 minutes</b>.<br>
+            If you did not request this, someone may have your ADMIN_TOKEN — change it immediately.
+        </p>
+    </div>
+    """
+    failed = []
+    for email in ADMIN_EMAILS:
+        result = send_email(email, subject, html_body)
+        if not result["ok"]:
+            failed.append(email)
+
+    if len(failed) == len(ADMIN_EMAILS):
+        return JSONResponse({"data": aes_encrypt({
+            "ok": False, "reason": "delivery_failed",
+            "detail": "OTP could not be delivered to any admin email"
+        })})
+
+    # Mask emails for response: alice@gmail.com → a***@gmail.com
+    def _mask(e):
+        parts = e.split("@")
+        return parts[0][0] + "***@" + parts[1] if len(parts)==2 else "***"
+
+    return JSONResponse({"data": aes_encrypt({
+        "ok":            True,
+        "sent_to":       [_mask(e) for e in ADMIN_EMAILS],
+        "otp_expires_in": 600,
+    })})
+
+
+@app.post("/admin/verify-otp")
+async def admin_verify_otp(payload: Payload):
+    """
+    Step 2 of admin login. Verifies the OTP and returns a session token.
+
+    Sends (encrypted): { admin_token, otp, timestamp }
+    Returns (encrypted):
+      { ok: true,  session_token: "...", expires_in: 1800 }
+      { ok: false, reason: "unauthorized" | "invalid_otp" | "otp_expired" |
+                           "max_attempts" | "not_requested" }
+    """
+    req = aes_decrypt(payload.data)
+    if not req or not valid_ts(req.get("timestamp", 0)):
+        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "expired"})})
+    if req.get("admin_token") != ADMIN_TOKEN:
+        return JSONResponse({"data": aes_encrypt({"ok": False, "reason": "unauthorized"})})
+
+    result = _verify_admin_otp(req.get("otp", "").strip())
+    if result != "ok":
+        reason_map = {
+            "invalid":      "invalid_otp",
+            "expired":      "otp_expired",
+            "max_attempts": "max_attempts_exceeded",
+            "not_requested":"otp_not_requested",
+        }
+        return JSONResponse({"data": aes_encrypt({
+            "ok": False, "reason": reason_map.get(result, result)
+        })})
+
+    issued_at     = int(time.time())
+    session_token = _make_session_token(issued_at)
+    return JSONResponse({"data": aes_encrypt({
+        "ok":           True,
+        "session_token": session_token,
+        "expires_in":   ADMIN_SESSION_MINUTES * 60,
+    })})
+
+
+@app.get("/admin/wrapped-secret")
+async def admin_wrapped_secret():
+    """
+    Returns the SHARED_SECRET wrapped (AES-256-GCM encrypted) with a key derived
+    from ADMIN_TOKEN via PBKDF2-SHA256 (100,000 iterations).
+
+    The browser uses this to unwrap SHARED_SECRET client-side after the admin
+    enters their password — SHARED_SECRET itself never appears in the HTML or
+    any API response in plaintext.
+
+    Returns (plaintext JSON — this is safe because the wrapped secret is useless
+    without the ADMIN_TOKEN password):
+      { salt: "<hex>", wrapped: "<hex>", iterations: 100000 }
+    """
+    import os as _os
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives    import hashes as _hashes
+    from cryptography.hazmat.backends      import default_backend as _backend
+
+    salt = _os.urandom(16)
+    kdf  = PBKDF2HMAC(
+        algorithm  = _hashes.SHA256(),
+        length     = 32,
+        salt       = salt,
+        iterations = 100_000,
+        backend    = _backend()
+    )
+    wrap_key  = kdf.derive(ADMIN_TOKEN.encode())
+    nonce     = _os.urandom(12)
+    ct        = AESGCM(wrap_key).encrypt(nonce, SHARED_SECRET, None)
+    return JSONResponse({
+        "salt":       salt.hex(),
+        "nonce":      nonce.hex(),
+        "wrapped":    ct.hex(),
+        "iterations": 100_000,
+    })
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  HEALTH
